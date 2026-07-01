@@ -17,6 +17,7 @@ import { IbkrBroker } from './ibkr/IbkrBroker.js'
 import { LeverupBroker } from './others/leverup/index.js'
 import { LongbridgeBroker } from './longbridge/index.js'
 import { MockBroker } from './mock/MockBroker.js'
+import { DexBroker } from './dex/DexBroker.js'
 import type { BrokerEngine } from '@traderalice/uta-protocol'
 
 /** Minimal engine entry: just enough to validate + instantiate. */
@@ -51,5 +52,9 @@ export const BROKER_ENGINE_REGISTRY: Record<BrokerEngine, BrokerEngineEntry> = {
   mock: {
     configSchema: MockBroker.configSchema,
     fromConfig: MockBroker.fromConfig,
+  },
+  dex: {
+    configSchema: DexBroker.configSchema,
+    fromConfig: DexBroker.fromConfig,
   },
 }

@@ -15,7 +15,7 @@ import { createHash, randomBytes } from 'node:crypto'
 
 // ==================== Types ====================
 
-export type BrokerEngine = 'ccxt' | 'alpaca' | 'ibkr' | 'leverup' | 'longbridge' | 'mock'
+export type BrokerEngine = 'ccxt' | 'alpaca' | 'ibkr' | 'leverup' | 'longbridge' | 'mock' | 'dex'
 
 export interface ModeOption {
   id: string
@@ -467,6 +467,37 @@ Paste the **private key of the authorized wallet** below. LeverUp's team confirm
   }),
 }
 
+// ==================== DEX (on-chain meme-coin trading) ====================
+
+export const DEX_PRESET: BrokerPresetDef = {
+  id: 'dex',
+  label: 'DEX (Solana / Ethereum / Base / BSC)',
+  description: 'On-chain meme-coin trading via Jupiter (Solana) or a Uniswap V2-compatible router (EVM). Paper mode is the default — real execution is not yet implemented.',
+  category: 'crypto',
+  hint: '**Paper mode is the only supported mode right now.** Fills are simulated against real DexScreener prices — no wallet, no private key, no real funds are involved. One account = one chain; add another DEX account to trade a different chain. Anti-scam checks run via GoPlus Security before every simulated buy, but that check is never a substitute for your own judgement — GoPlus does not catch every scam.',
+  defaultName: 'dex-solana',
+  badge: 'DEX',
+  badgeColor: 'text-accent',
+  engine: 'dex',
+  guardCategory: 'crypto',
+  zodSchema: z.object({
+    chain: z.enum(['solana', 'ethereum', 'base', 'bsc']).describe('Chain'),
+    paper: z.boolean().default(true).describe('Paper mode (simulated fills, no real funds)'),
+    paperCashUsd: z.coerce.number().default(1000).describe('Starting paper cash (USD)'),
+  }),
+  subtitleFields: [
+    { field: 'chain', prefix: 'DEX · ' },
+    { field: 'paper', label: 'Paper' },
+  ],
+  fingerprintFields: ['chain'],
+  toEngineConfig: (d) => ({
+    chain: d.chain,
+    paper: d.paper,
+    paperCashUsd: d.paperCashUsd,
+  }),
+  isPaper: (d) => Boolean(d.paper),
+}
+
 // ==================== Testing presets ====================
 
 export const SIMULATOR_PRESET: BrokerPresetDef = {
@@ -515,6 +546,7 @@ export const BROKER_PRESET_CATALOG: BrokerPresetDef[] = [
   BYBIT_PRESET,
   BITGET_PRESET,
   LEVERUP_PRESET,
+  DEX_PRESET,
   // Escape hatch — untested CCXT exchanges; lives at the end of Crypto.
   CCXT_CUSTOM_PRESET,
   // ---- Testing ----
