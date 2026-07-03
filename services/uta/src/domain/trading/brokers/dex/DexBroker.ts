@@ -41,6 +41,15 @@ import { buildPosition } from '../contract-builder.js'
 import { pairToContract, tokenAddressToContract, contractToTokenAddress } from './dex-contracts.js'
 import { searchDexScreenerPairs, fetchDexScreenerTokenPairs, bestPair, type DexScreenerPair } from './dex-market-data.js'
 
+/**
+ * Mirrors scripts/scan/live-scan.ts's TRADE_AMOUNT_USD — duplicated rather
+ * than imported, since a domain/broker module must not depend on an
+ * application script (same convention as dex-market-data.ts/wallet-watcher.ts
+ * each independently resolving HELIUS_API_KEY). Keep the two in sync if
+ * position sizing changes.
+ */
+const DEFAULT_RESTORE_TRADE_USD = 50
+
 export const DEX_CHAINS = ['solana', 'ethereum', 'base', 'bsc'] as const
 export type DexChain = (typeof DEX_CHAINS)[number]
 
@@ -162,14 +171,23 @@ export class DexBroker implements IBroker<DexBrokerMeta> {
 
   // ---- Trading operations ----
 
-  async placeOrder(contract: Contract, order: Order, _tpsl?: TpSlParams): Promise<PlaceOrderResult> {
+  /**
+   * `knownPair` skips the DexScreener fetch entirely when the caller already
+   * has a fresh pair in hand — e.g. live-scan.ts's scan loop fetches the
+   * pair once per candidate, then both `checkTokenSecurity` and this method
+   * used to each re-fetch the exact same data independently. Absent, this
+   * behaves exactly as before (fetches via `getQuote`).
+   */
+  async placeOrder(contract: Contract, order: Order, _tpsl?: TpSlParams, knownPair?: DexScreenerPair): Promise<PlaceOrderResult> {
     if (!this.paper) {
       return { success: false, error: 'Real DEX execution is not implemented yet (paper: false)' }
     }
 
     let quote: Quote
     try {
-      quote = await this.getQuote(contract)
+      quote = knownPair
+        ? this.buildQuoteFromPair(contract, contractToTokenAddress(contract), knownPair)
+        : await this.getQuote(contract)
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
@@ -220,6 +238,48 @@ export class DexBroker implements IBroker<DexBrokerMeta> {
     order.orderType = 'MKT'
     order.totalQuantity = quantity ?? pos.quantity
     return this.placeOrder(pos.contract, order)
+  }
+
+  /**
+   * Re-inject a position into the in-memory ledger without any network call
+   * or quote fetch — synchronous, no `getQuote()`, no TradingGit event (this
+   * is state recovery, not a new order). Used at scanner startup to recover
+   * what position-tracker.ts persisted across a process restart: this
+   * ledger is purely in-memory and would otherwise start empty, causing
+   * `evaluateStrategy`'s `hasOpenPosition` check to miss the position and
+   * re-buy the same token (see live-scan.ts's restore loop). Same weighted-
+   * average-cost accumulation as `applyFill`'s BUY path, so calling this
+   * twice for the same token merges rather than duplicating.
+   *
+   * `quantity` defaults to `DEFAULT_RESTORE_TRADE_USD / entryPrice` — valid
+   * only as long as every buy uses that same fixed trade size; pass an
+   * explicit `quantity` when that assumption doesn't hold.
+   */
+  restorePosition(tokenAddress: string, entryPrice: number, quantity?: number): void {
+    if (!this.paper) {
+      throw new BrokerError('CONFIG', 'restorePosition is only supported in paper mode')
+    }
+    const price = new Decimal(entryPrice)
+    if (!price.isFinite() || !price.gt(0)) {
+      throw new Error(`DexBroker[${this.id}]: cannot restore position for ${tokenAddress} — invalid entryPrice ${entryPrice}`)
+    }
+    const qty = quantity != null ? new Decimal(quantity) : new Decimal(DEFAULT_RESTORE_TRADE_USD).div(price)
+
+    const contract = tokenAddressToContract(tokenAddress, this.chain)
+    this.rememberContract(contract)
+    const key = this.getNativeKey(contract)
+
+    const existing = this.positions.get(key)
+    if (existing) {
+      const totalCost = existing.avgCost.mul(existing.quantity).plus(price.mul(qty))
+      existing.quantity = existing.quantity.plus(qty)
+      existing.avgCost = totalCost.div(existing.quantity)
+    } else {
+      this.positions.set(key, { contract, quantity: qty, avgCost: price })
+    }
+    this.cash = this.cash.minus(qty.mul(price))
+
+    console.log(`DexBroker[${this.id}]: Restored position: ${tokenAddress} qty=${qty.toFixed()} avgCost=${price.toFixed()}`)
   }
 
   // ---- Queries ----
@@ -298,13 +358,18 @@ export class DexBroker implements IBroker<DexBrokerMeta> {
   async getQuote(contract: Contract): Promise<Quote> {
     const tokenAddress = contractToTokenAddress(contract)
     const pairs = await fetchDexScreenerTokenPairs(this.chain, tokenAddress)
-    const pair = bestPair(pairs)
-    // A zero/negative/malformed price is never valid and must be rejected
-    // here rather than left for callers to divide by: `cashQty.div(0)`
-    // silently produces Infinity (Decimal.js doesn't throw on it), which
-    // then poisons the paper ledger with NaN cash instead of failing the
-    // order cleanly. `new Decimal()` itself throws on a non-numeric string,
-    // hence the try/catch rather than a bare `.gt(0)` check.
+    return this.buildQuoteFromPair(contract, tokenAddress, bestPair(pairs))
+  }
+
+  /**
+   * A zero/negative/malformed price is never valid and must be rejected
+   * here rather than left for callers to divide by: `cashQty.div(0)`
+   * silently produces Infinity (Decimal.js doesn't throw on it), which
+   * then poisons the paper ledger with NaN cash instead of failing the
+   * order cleanly. `new Decimal()` itself throws on a non-numeric string,
+   * hence the try/catch rather than a bare `.gt(0)` check.
+   */
+  private buildQuoteFromPair(contract: Contract, tokenAddress: string, pair: DexScreenerPair | null): Quote {
     let price: Decimal | null = null
     try {
       price = pair?.priceUsd ? new Decimal(pair.priceUsd) : null

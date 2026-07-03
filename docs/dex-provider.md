@@ -85,6 +85,58 @@ equal to `minLiquidityUsd` passes.
 enforced on Solana at all, so a liquidity floor is currently the *only*
 defense this guard has against a thin, easily-manipulated Solana pool.
 
+## Retrospective / Backtest
+
+Two read-only CLI reports answer "if the bot had been running, would its
+decisions have been good?" — both reuse the exact same filter logic the
+live guard runs (`checkTokenSecurity()`, `dex-contracts.ts`/`dex-market-data.ts`
+helpers), so the retro view and the live view can't drift apart over time.
+
+### `pnpm retro:today [--chain solana|ethereum|base|bsc|all] [--min-liquidity <usd>]`
+
+Scans DexScreener's "latest token profiles" feed for tokens created in the
+last 24h, runs each one through `checkTokenSecurity()` with the same
+thresholds `docs/dex-provider.md`'s example config uses (`--min-liquidity`
+overrides `minLiquidityUsd`), and reports each candidate's DexScreener
+`priceChange` (nearest window to the token's actual age: `h1`/`h6`/`h24`) as
+a proxy for "what would its return have looked like since detection."
+
+**This is an approximation, not a simulation** — it uses DexScreener data as
+observed *right now*, not the state as of the moment a live scanner would
+actually have detected each token. The bot did not really run. The terminal
+output and the written report both say so explicitly.
+
+```bash
+pnpm retro:today --chain solana
+```
+
+### `pnpm retro:replay --account <accountId> [--from <date>] [--to <date>]`
+
+Once a DEX account has actually run in paper mode, this replays its real
+`TradingGit` commit history (`loadGitState()` / `TradingGit.restore()` — the
+same rehydration path the live UTA process uses) and reconstructs each
+position's lifecycle by diffing `stateAfter.positions` across commits.
+Still-open positions are marked to the current live DexScreener price
+(reusing the same lookup `DexBroker.getQuote()` uses); closed positions'
+exit price is derived from the **cash delta** between the commit where the
+position was last present and the commit where it disappeared — not from
+`OperationResult.filledPrice`, which is only populated later by a separate
+`syncOrders` commit from the order-sync poller, not on the `placeOrder`
+commit itself.
+
+Reports: win rate, average return, best/worst position, and how many
+positions are still open. Positions with no resolvable current price
+(DexScreener has nothing for the token) are excluded from the win-rate/
+average-return stats rather than silently counted as a loss.
+
+```bash
+pnpm retro:replay --account dex-solana-a1b2c3d4
+```
+
+Both commands print a terminal summary and write a markdown report to
+`data/retro/{date}-today-{chain}.md` / `data/retro/{date}-replay-{accountId}.md`
+so days can be compared over time.
+
 ## Known limitations
 
 - **Real execution isn't implemented.** No private key handling, no

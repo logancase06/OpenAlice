@@ -206,6 +206,61 @@ describe('DexBroker.placeOrder (paper mode)', () => {
   })
 })
 
+describe('DexBroker.restorePosition', () => {
+  it('initializes avgCost and quantity from entryPrice, defaulting quantity to TRADE_AMOUNT_USD / entryPrice', async () => {
+    const broker = new DexBroker({ id: 'dex-solana', chain: 'solana', paper: true, paperCashUsd: 1000 })
+
+    broker.restorePosition('tokenA', 0.05)
+
+    const positions = await broker.getPositions()
+    expect(positions).toHaveLength(1)
+    expect(positions[0].avgCost).toBe('0.05')
+    expect(positions[0].quantity.toString()).toBe('1000') // 50 / 0.05
+  })
+
+  it('debits cash by quantity * entryPrice', async () => {
+    const broker = new DexBroker({ id: 'dex-solana', chain: 'solana', paper: true, paperCashUsd: 1000 })
+
+    broker.restorePosition('tokenA', 0.05) // 1000 units * 0.05 = 50
+
+    const account = await broker.getAccount()
+    expect(account.totalCashValue).toBe('950')
+  })
+
+  it('an explicit quantity is used instead of TRADE_AMOUNT_USD / entryPrice', async () => {
+    const broker = new DexBroker({ id: 'dex-solana', chain: 'solana', paper: true, paperCashUsd: 1000 })
+
+    broker.restorePosition('tokenA', 0.05, 200)
+
+    const positions = await broker.getPositions()
+    expect(positions[0].quantity.toString()).toBe('200')
+    const account = await broker.getAccount()
+    expect(account.totalCashValue).toBe('990') // 1000 - 200*0.05
+  })
+
+  it('getPositions reflects the restored position (hasOpenPosition-style lookup would find it)', async () => {
+    const broker = new DexBroker({ id: 'dex-solana', chain: 'solana', paper: true })
+
+    broker.restorePosition('tokenA', 0.05)
+
+    const positions = await broker.getPositions()
+    expect(positions.some(p => (p.contract.localSymbol || p.contract.symbol) === 'tokenA')).toBe(true)
+  })
+
+  it('closePosition works on a restored position instead of failing with "No open position"', async () => {
+    pairsMock.mockResolvedValue([pair({ address: 'tokenA', priceUsd: '0.10' })])
+    const broker = new DexBroker({ id: 'dex-solana', chain: 'solana', paper: true, paperCashUsd: 1000 })
+
+    broker.restorePosition('tokenA', 0.05, 1000)
+    const contract = broker.resolveNativeKey('tokenA')
+
+    const result = await broker.closePosition(contract)
+
+    expect(result.success).toBe(true)
+    expect(await broker.getPositions()).toHaveLength(0)
+  })
+})
+
 describe('DexBroker unsupported operations', () => {
   it('modifyOrder and cancelOrder fail — DEX swaps have no resting order', async () => {
     const broker = new DexBroker({ id: 'dex-solana', chain: 'solana', paper: true })

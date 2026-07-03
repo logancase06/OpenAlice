@@ -19,6 +19,12 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:bbProvider": "vitest run --config vitest.bbProvider.config.ts",
     "test:smoke": "tsx scripts/guardian/smoke.ts",
+    "retro:today": "node --conditions=openalice-source --import tsx/esm scripts/retro/today.ts",
+    "retro:replay": "node --conditions=openalice-source --import tsx/esm scripts/retro/replay.ts",
+    "retro:exitsim": "node --conditions=openalice-source --import tsx/esm scripts/retro/exit-sim.ts",
+    "retro:full": "node --conditions=openalice-source --import tsx/esm scripts/retro/full-retro.ts",
+    "scan:live": "node --conditions=openalice-source --import tsx/esm scripts/scan/live-scan.ts",
+    "wallets:bootstrap": "node --conditions=openalice-source --import tsx/esm services/uta/src/domain/trading/brokers/dex/wallet-bootstrapper.ts",
     "postinstall": "node scripts/fix-pty-perms.mjs"
   },
   "keywords": [
