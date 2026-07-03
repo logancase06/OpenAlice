@@ -574,6 +574,86 @@ export async function appendScanLog(entry: LogEntry): Promise<void> {
   await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
 }
 
+// ==================== Silent-distribution observability (2026-07-03) ====================
+// Hypothesis sourced from public memecoin market-making writeups (informally
+// called "Drizzle"/"Burst" patterns in some of them) — NOT an academically
+// validated signal, flagged here as exactly that. Claim: a token can show a
+// large buy-transaction count with no proportional price response because a
+// seller (dev/whale) is quietly absorbing that buy pressure by distributing
+// into it, rather than the buy pressure itself being weak.
+// `checkTxnActivity`'s existing `maxSellBuyRatio1h` (TokenSecurityGuard.ts)
+// can't catch this: it counts sell TRANSACTIONS, and one large sell can
+// offset many small buys in dollar terms while still registering as a
+// single, unremarkable sell count — the same blind spot this instrumentation
+// targets.
+//
+// Retroactive test (2026-07-03, n=1392 EARLY/EARLY_STRICT/EARLY_WEB_FILTERED
+// trades with a resolvable pre-entry scan snapshot — see
+// data/notes/session-summary.md): flagging `txns.h1.buys >= 3770` (top
+// quartile of this population) AND `priceChange.h1 <= -7.64%` (bottom
+// quartile) gave n=51 (3.7%) with a BETTER average return (+4.04pp vs
+// -2.18pp) and 0% rug rate than the rest — the OPPOSITE direction from the
+// hypothesis. A quartile split on that n=51 was highly unstable (+2.76pp,
+// -10.44pp, +25.91pp, -0.85pp across the 4 quartiles, no consistent sign) —
+// no reliable retroactive signal either way. Age/entry-liquidity confounds
+// checked and ruled out (both groups near-identical: ~84min age, ~$25-27k
+// liquidity).
+//
+// This instrumentation exists BECAUSE that retroactive test's proxy
+// (transaction COUNT, not $ volume or whale-specific detection) is a weak
+// operationalization of the actual hypothesis, and because a backtest can
+// only see trades that were actually bought — it has no comparison group of
+// candidates that matched the pattern and were passed over. Logging fires
+// for EVERY candidate `runScanPhase` evaluates regardless of buy outcome,
+// building the comparative sample the backtest couldn't assemble on its own.
+// Thresholds below are the same ones the retroactive quartile analysis used
+// — provisional, not re-derived dynamically from the live sample as it
+// accumulates (same "fixed constant, not adaptive" convention as
+// STOP_LOSS_OVERSHOOT_ALERT_PP).
+//
+// Zero effect on trading decisions — logging only, same convention as
+// stopLossOvershootCount. Written to its own file (dataPath, i.e. the real
+// `~/.openalice/data` root), NOT the repo's `data/notes/` — that directory
+// holds hand-authored session documentation, not scanner telemetry.
+const SILENT_DISTRIBUTION_MIN_BUYS_H1 = 3770
+const SILENT_DISTRIBUTION_MAX_PRICE_CHANGE_H1 = -7.64
+
+interface SilentDistributionMatch {
+  buysH1: number
+  sellsH1?: number
+  priceChangeH1: number
+  priceChangeM5?: number
+}
+
+/** Returns the triggering metrics when the pattern matches, `null` otherwise (including when the underlying DexScreener fields are missing — no data is never treated as a match). */
+function detectSilentDistributionPattern(pair: DexScreenerPair): SilentDistributionMatch | null {
+  const buysH1 = pair.txns?.h1?.buys
+  const priceChangeH1 = pair.priceChange?.h1
+  if (buysH1 == null || priceChangeH1 == null) return null
+  if (buysH1 < SILENT_DISTRIBUTION_MIN_BUYS_H1 || priceChangeH1 > SILENT_DISTRIBUTION_MAX_PRICE_CHANGE_H1) return null
+  return { buysH1, sellsH1: pair.txns?.h1?.sells, priceChangeH1, priceChangeM5: pair.priceChange?.m5 }
+}
+
+interface SilentDistributionLogEntry extends SilentDistributionMatch {
+  timestamp: string
+  tokenAddress: string
+  symbol: string
+  liquidityUsd: number
+  ageMinutes: number
+  /** Which strategies' evaluateStrategy() call passed for this candidate this same cycle — [] means detected but not bought by anything running today. */
+  passedStrategies: StrategyLabel[]
+}
+
+export function silentDistributionLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('silent-distribution', `${date}.jsonl`)
+}
+
+export async function appendSilentDistributionLog(entry: SilentDistributionLogEntry): Promise<void> {
+  const filePath = silentDistributionLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
 // ==================== Strategy evaluation ====================
 
 async function hasOpenPosition(broker: DexBroker, tokenAddress: string): Promise<boolean> {
@@ -991,6 +1071,23 @@ export async function runScanPhase(
       const decision = await evaluateStrategy(config, chain, profile.tokenAddress, ageMinutes, broker, pair)
       decisions[config.label] = decision
       if (decision.pass) stats.passed[config.label]++
+    }
+
+    // Observability only — see the section header above detectSilentDistributionPattern
+    // for the hypothesis, its retroactive test result, and why this logs
+    // every candidate regardless of buy outcome.
+    const silentDistMatch = detectSilentDistributionPattern(pair)
+    if (silentDistMatch) {
+      const passedStrategies = (Object.keys(decisions) as StrategyLabel[]).filter(label => decisions[label]?.pass)
+      await appendSilentDistributionLog({
+        timestamp: new Date(now).toISOString(),
+        tokenAddress: profile.tokenAddress,
+        symbol: pair.baseToken.symbol,
+        liquidityUsd: pair.liquidity?.usd ?? 0,
+        ageMinutes,
+        passedStrategies,
+        ...silentDistMatch,
+      })
     }
 
     const nameFilter = checkTokenName(pair.baseToken.symbol, pair.baseToken.name)

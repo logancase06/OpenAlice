@@ -76,6 +76,7 @@ import {
   EARLY_CONFIG,
   EARLY_STRICT_CONFIG,
   EARLY_WEB_FILTERED_CONFIG,
+  silentDistributionLogPath,
   EARLY_EXIT_CONFIG,
   SCALP_EXIT_CONFIG,
   runLiveScan,
@@ -142,6 +143,15 @@ async function readScanLog(): Promise<Array<Record<string, unknown>>> {
   }
 }
 
+async function readSilentDistributionLog(): Promise<Array<Record<string, unknown>>> {
+  try {
+    const raw = await readFile(silentDistributionLogPath(), 'utf-8')
+    return raw.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  } catch {
+    return []
+  }
+}
+
 beforeEach(() => {
   profilesMock.mockReset()
   pairsMock.mockReset()
@@ -165,6 +175,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await rm(dataPath('scan-log'), { recursive: true, force: true })
+  await rm(dataPath('silent-distribution'), { recursive: true, force: true })
   await rm(dataPath('snapshots'), { recursive: true, force: true })
   await rm(dataPath('positions'), { recursive: true, force: true })
   await rm(dataPath('wallets'), { recursive: true, force: true })
@@ -1097,6 +1108,76 @@ describe('Helius pool watchlist', () => {
     const crossCheckLogs = logSpy.mock.calls.filter(c => String(c[0]).includes('old DexScreener-profiles pipeline caught up'))
     expect(crossCheckLogs).toHaveLength(0)
     logSpy.mockRestore()
+  })
+})
+
+describe('silent-distribution observability (detectSilentDistributionPattern)', () => {
+  it('logs a candidate matching the pattern — high h1 buys with a weak/negative h1 price response', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'silentDistTok' }])
+    pairsMock.mockResolvedValue([pair({
+      address: 'silentDistTok', ageMinutes: 60, liquidity: { usd: 20_000 },
+      txns: { h1: { buys: 4000, sells: 50 } },
+      priceChange: { h1: -10, m5: -1 },
+    })])
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    const entries = await readSilentDistributionLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ tokenAddress: 'silentDistTok', buysH1: 4000, sellsH1: 50, priceChangeH1: -10, priceChangeM5: -1, passedStrategies: [] })
+  })
+
+  it('does not log a candidate with high buys but a strong positive price response', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'normalPumpTok' }])
+    pairsMock.mockResolvedValue([pair({
+      address: 'normalPumpTok', ageMinutes: 60, liquidity: { usd: 20_000 },
+      txns: { h1: { buys: 4000, sells: 50 } },
+      priceChange: { h1: 50, m5: 5 },
+    })])
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    expect(await readSilentDistributionLog()).toHaveLength(0)
+  })
+
+  it('does not log a candidate with a weak price response but low buy count', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'lowActivityTok' }])
+    pairsMock.mockResolvedValue([pair({
+      address: 'lowActivityTok', ageMinutes: 60, liquidity: { usd: 20_000 },
+      txns: { h1: { buys: 100, sells: 10 } },
+      priceChange: { h1: -20, m5: -2 },
+    })])
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    expect(await readSilentDistributionLog()).toHaveLength(0)
+  })
+
+  it('does not log when priceChange.h1 or txns.h1.buys is missing — no data is not treated as a match', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'noDataTok' }])
+    pairsMock.mockResolvedValue([pair({ address: 'noDataTok', ageMinutes: 60, liquidity: { usd: 20_000 } })])
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    expect(await readSilentDistributionLog()).toHaveLength(0)
+  })
+
+  it('records which strategies passed for a matching candidate this same cycle', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'silentDistBoughtTok' }])
+    const candidate = pair({
+      address: 'silentDistBoughtTok', ageMinutes: 100, liquidity: { usd: 50_000 },
+      txns: { h1: { buys: 4000, sells: 50 }, m5: { buys: 20, sells: 2 } },
+      priceChange: { h1: -10, m5: -1 },
+    })
+    pairsMock.mockResolvedValue([candidate])
+    const broker = new DexBroker({ id: 'silent-dist-bought', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+
+    await runScanPhase('solana', [{ config: { ...EARLY_CONFIG, useSolanaRpc: false }, broker }], new RateLimiter(), freshStats())
+
+    const entries = await readSilentDistributionLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.passedStrategies).toEqual(['early'])
   })
 })
 
