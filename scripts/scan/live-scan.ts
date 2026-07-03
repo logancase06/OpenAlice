@@ -228,6 +228,60 @@ export const EARLY_WEB_FILTERED_CONFIG: StrategyConfig = {
   requireWebsite: true,
 }
 
+/**
+ * Suspended 2026-07-04 — entry only, not the strategy itself, same pattern
+ * as GRAD_IMMEDIATE_ENTRY_SUSPENDED/GRAD_DIP_ENTRY_SUSPENDED. This pilot hit
+ * its own reopen bar (n>=20 unique tokens, quartile split on the live
+ * sample) and the result is a clean miss, not an ambiguous one:
+ *
+ * Live sample at reopen check: n=179 trades / 34 unique tokens (max
+ * concentration on one token: STREETART at 8.9% of trades — not a
+ * repeat of the earlier 6-token/50%-concentration problem this reopen
+ * bar was specifically designed to catch). Token-weighted average return
+ * (each token counted once, not once per trade): -3.95pp, rug rate 2.9%
+ * (1/34 tokens). Quartile walk-forward (chronological, by token):
+ *   Q1 (n=8 tokens):  -12.12pp, rug rate 12.5%
+ *   Q2 (n=8 tokens):   -4.58pp, rug rate 0%
+ *   Q3 (n=8 tokens):   +1.81pp, rug rate 0%
+ *   Q4 (n=10 tokens):  -1.52pp, rug rate 0%
+ * Q3->Q4 reverses sign (+1.81 -> -1.52) — fails the "no reversal" bar this
+ * strategy's own adoption doc (see EARLY_WEB_FILTERED_CONFIG above) held
+ * hasWebsite to before deploying it here in the first place.
+ *
+ * Same-window comparison (identical time range, since this pilot's
+ * restart) against the two strategies it was meant to potentially replace
+ * as a filter: EARLY -1.36pp, EARLY_STRICT -3.29pp, EARLY_WEB_FILTERED
+ * -4.04pp (all token-weighted) — this strategy is not better than either
+ * of the two it was piloted against, let alone the retrospective backtest
+ * that motivated it (+0.11pp expected once `hasWebsite=false` candidates
+ * are rejected, see EARLY_WEB_FILTERED_CONFIG's docstring). The signal
+ * that looked promising on replayed history did not reproduce going
+ * forward on live data.
+ *
+ * Diagnosis: unlike GRAD_IMMEDIATE (sign-reversal degradation) or GRAD_DIP
+ * (flat absence of signal, dedup bug inflating the count), this is neither
+ * a bug nor a data-quality problem — the retrospective join, the field
+ * coverage, and the live trade recording all checked out. The signal
+ * itself simply did not replicate out-of-sample. See
+ * data/notes/session-summary.md's methodological-lessons section for why
+ * this is treated as a distinct case from the `creator`-field bug (that
+ * one was a measurement artifact; this one is a real signal that doesn't
+ * hold over time).
+ *
+ * `handleNewPumpToken`/`evaluateStrategy`'s buy path for this label is
+ * gated off below (see EARLY_WEB_FILTERED_ENTRY_SUSPENDED's usage) — the
+ * strategy config, its broker, and its exit checks (still on the fast
+ * regime timer, see FAST_EXIT_REGIME_LABELS) stay fully intact so it
+ * remains backtestable/re-runnable. No positions are force-closed;
+ * existing early_web_filtered positions run to their normal exit.
+ *
+ * Reopen threshold: a different hypothesis or a materially different
+ * sample (e.g. re-testing hasWebsite fresh on a later, larger dataset) —
+ * not more time on the current live pilot, which already cleared its own
+ * volume bar and still failed.
+ */
+export const EARLY_WEB_FILTERED_ENTRY_SUSPENDED = true
+
 // COPY_WALLET exit config, adopted 2026-07-02 alongside the preset below —
 // tighter and faster than EARLY_EXIT_CONFIG on the premise that a wallet
 // with a real, independently-measured track record (wallet-bootstrapper.ts)
@@ -686,6 +740,10 @@ export async function evaluateStrategy(
   const openCount = (await broker.getPositions()).length
   if (openCount >= MAX_OPEN_POSITIONS_PER_STRATEGY) {
     return { pass: true, reason: `passed all checks (max ${MAX_OPEN_POSITIONS_PER_STRATEGY} open positions reached — no additional buy)`, tradeSimulated: false }
+  }
+
+  if (cfg.label === 'early_web_filtered' && EARLY_WEB_FILTERED_ENTRY_SUSPENDED) {
+    return { pass: true, reason: 'passed all checks (EARLY_WEB_FILTERED entry suspended — see EARLY_WEB_FILTERED_ENTRY_SUSPENDED docstring); exits for existing positions still active', tradeSimulated: false }
   }
 
   const contract = broker.resolveNativeKey(tokenAddress)
@@ -1839,7 +1897,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   console.log(`Graduated tracker: ${graduatedTracker.getAll().length} tokens (loaded from active.json)`)
   console.log(`GRAD_IMMEDIATE   : ${GRAD_IMMEDIATE_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-02, negative expectancy — see GRAD_IMMEDIATE_ENTRY_SUSPENDED docstring); exits for existing positions still active' : heliusKeyPresent ? `enabled (${GRAD_IMMEDIATE_POST_GRAD_DELAY_MS / 1000}s delay post-graduation)` : 'disabled — needs Graduation feed'}`)
   console.log(`GRAD_DIP         : ${GRAD_DIP_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-03, no positive signal on clean n=33/12 tokens — see GRAD_DIP_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled (25-60% dip from peak)'}`)
-  console.log('EARLY_WEB_FILTERED : enabled, parallel pilot (requireWebsite, EARLY otherwise unchanged) — see EARLY_WEB_FILTERED_CONFIG docstring for the quartile-instability caveat and n≥30+quartile reopen threshold')
+  console.log(`EARLY_WEB_FILTERED : ${EARLY_WEB_FILTERED_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-04, reopen bar cleared at n=34 tokens but token-weighted return -3.95pp with a Q3->Q4 sign reversal — see EARLY_WEB_FILTERED_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled, parallel pilot (requireWebsite, EARLY otherwise unchanged) — see EARLY_WEB_FILTERED_CONFIG docstring for the quartile-instability caveat and n≥30+quartile reopen threshold'}`)
 
   // EARLY_STRICT replaces SCALP_MOMENTUM_CONFIG here — see EARLY_STRICT_CONFIG's
   // docstring for why (SCALP stayed at 0/120 passes even after relaxing its

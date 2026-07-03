@@ -76,6 +76,7 @@ import {
   EARLY_CONFIG,
   EARLY_STRICT_CONFIG,
   EARLY_WEB_FILTERED_CONFIG,
+  EARLY_WEB_FILTERED_ENTRY_SUSPENDED,
   silentDistributionLogPath,
   EARLY_EXIT_CONFIG,
   SCALP_EXIT_CONFIG,
@@ -825,17 +826,10 @@ describe('evaluateStrategy — fastExitRegime stamping', () => {
     expect(positions.find(p => p.tokenAddress === 'fastRegimeStrictTok')?.fastExitRegime).toBe(true)
   })
 
-  it('stamps fastExitRegime: true on an EARLY_WEB_FILTERED buy', async () => {
-    const candidate = pair({ address: 'fastRegimeWebTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 }, info: { websites: [{ url: 'https://example.com' }] } })
-    pairsMock.mockResolvedValue([candidate])
-    const broker = new DexBroker({ id: 'fast-regime-web-filtered', chain: 'solana', paper: true, paperCashUsd: 1000 })
-    await broker.init()
-
-    await evaluateStrategy({ ...EARLY_WEB_FILTERED_CONFIG, useSolanaRpc: false }, 'solana', 'fastRegimeWebTok', 100, broker, candidate)
-
-    const positions = await getOpenPositions()
-    expect(positions.find(p => p.tokenAddress === 'fastRegimeWebTok')?.fastExitRegime).toBe(true)
-  })
+  // EARLY_WEB_FILTERED's own fastExitRegime stamp can no longer be observed
+  // via a real buy now that EARLY_WEB_FILTERED_ENTRY_SUSPENDED gates it off
+  // (see that flag's docstring) — the stamping logic itself isn't specific
+  // to this label and stays covered by the EARLY/EARLY_STRICT cases above.
 
   it('leaves fastExitRegime undefined on a CONSERVATIVE buy — not in the fast regime', async () => {
     pairsMock.mockResolvedValue([pair({ address: 'slowRegimeTok', ageMinutes: 400, priceUsd: '0.05', liquidity: { usd: 50_000 } })])
@@ -869,7 +863,8 @@ describe('EARLY_WEB_FILTERED_CONFIG', () => {
     expect(await broker.getPositions()).toHaveLength(0)
   })
 
-  it('buys a candidate with a website listed, same as EARLY otherwise would', async () => {
+  it('passes a candidate with a website listed but does not buy — entry suspended (see EARLY_WEB_FILTERED_ENTRY_SUSPENDED)', async () => {
+    expect(EARLY_WEB_FILTERED_ENTRY_SUSPENDED).toBe(true) // guards this test against silently going stale if the flag is ever flipped back
     const broker = new DexBroker({ id: 'web-filtered-buy', chain: 'solana', paper: true, paperCashUsd: 1000 })
     await broker.init()
     const candidate = pair({ address: 'hasWebsiteTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 }, info: { websites: [{ url: 'https://example.com' }] } })
@@ -877,6 +872,31 @@ describe('EARLY_WEB_FILTERED_CONFIG', () => {
     const decision = await evaluateStrategy({ ...EARLY_WEB_FILTERED_CONFIG, useSolanaRpc: false }, 'solana', 'hasWebsiteTok', 100, broker, candidate)
 
     expect(decision.pass).toBe(true)
+    expect(decision.tradeSimulated).toBe(false)
+    expect(decision.reason).toMatch(/entry suspended/i)
+    expect(await broker.getPositions()).toHaveLength(0)
+  })
+})
+
+describe('EARLY_WEB_FILTERED_ENTRY_SUSPENDED', () => {
+  it('is true (2026-07-04, reopen bar cleared at n=34 tokens but token-weighted return -3.95pp with a Q3->Q4 sign reversal) — pinned so a silent flip back is caught here rather than discovered live', () => {
+    expect(EARLY_WEB_FILTERED_ENTRY_SUSPENDED).toBe(true)
+  })
+
+  it('an already-open EARLY_WEB_FILTERED position (restored from a previous session) is left alone — suspension is entry-only, exits still evaluated normally', async () => {
+    // Age must fall inside EARLY_WEB_FILTERED_CONFIG's age window, otherwise
+    // the age filter itself would reject before ever reaching hasOpenPosition.
+    await openPosition(pair({ address: 'existingWebFilteredTok', ageMinutes: 100, priceUsd: '0.05' }), 'early_web_filtered', 0.05, 100, EARLY_EXIT_CONFIG)
+
+    const broker = new DexBroker({ id: 'web-filtered-existing-position', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    await restoreOpenPositions([{ config: EARLY_WEB_FILTERED_CONFIG, broker }])
+
+    const candidate = pair({ address: 'existingWebFilteredTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 }, info: { websites: [{ url: 'https://example.com' }] } })
+    const decision = await evaluateStrategy({ ...EARLY_WEB_FILTERED_CONFIG, useSolanaRpc: false }, 'solana', 'existingWebFilteredTok', 100, broker, candidate)
+
+    expect(decision.pass).toBe(true)
+    expect(decision.reason).toMatch(/already holding/i)
     expect(await broker.getPositions()).toHaveLength(1)
   })
 })
