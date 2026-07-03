@@ -78,6 +78,7 @@ import {
   EARLY_WEB_FILTERED_CONFIG,
   EARLY_WEB_FILTERED_ENTRY_SUSPENDED,
   silentDistributionLogPath,
+  positionTrajectoryLogPath,
   EARLY_EXIT_CONFIG,
   SCALP_EXIT_CONFIG,
   runLiveScan,
@@ -153,6 +154,15 @@ async function readSilentDistributionLog(): Promise<Array<Record<string, unknown
   }
 }
 
+async function readPositionTrajectoryLog(): Promise<Array<Record<string, unknown>>> {
+  try {
+    const raw = await readFile(positionTrajectoryLogPath(), 'utf-8')
+    return raw.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  } catch {
+    return []
+  }
+}
+
 beforeEach(() => {
   profilesMock.mockReset()
   pairsMock.mockReset()
@@ -177,6 +187,7 @@ beforeEach(() => {
 afterEach(async () => {
   await rm(dataPath('scan-log'), { recursive: true, force: true })
   await rm(dataPath('silent-distribution'), { recursive: true, force: true })
+  await rm(dataPath('position-trajectory'), { recursive: true, force: true })
   await rm(dataPath('snapshots'), { recursive: true, force: true })
   await rm(dataPath('positions'), { recursive: true, force: true })
   await rm(dataPath('wallets'), { recursive: true, force: true })
@@ -800,6 +811,109 @@ describe('checkExits — stop_loss overshoot observability (2026-07-02)', () => 
 
     expect(getStopLossOvershootCount()).toBe(0)
     expect(warnSpy.mock.calls.some(c => c.join(' ').includes('stop_loss overshoot'))).toBe(false)
+  })
+})
+
+describe('checkExits — position-trajectory observability (2026-07-04)', () => {
+  const ENTRY_PRICE = 0.10
+
+  it('logs a trajectory tick for a fast-regime strategy (early) on a normal, non-exiting check', async () => {
+    pairsMock.mockResolvedValue([pair({ address: 'trajTok', ageMinutes: 100, priceUsd: '0.10', liquidity: { usd: 50_000 } })])
+    const broker = new DexBroker({ id: 'traj-test', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    await evaluateStrategy({ ...EARLY_CONFIG, useSolanaRpc: false }, 'solana', 'trajTok', 100, broker, pair({ address: 'trajTok', ageMinutes: 100 }))
+    const [position] = await getOpenPositions()
+
+    vi.spyOn(priceFeed, 'getLatestPrice').mockReturnValue({
+      pairAddress: 'pair-trajTok',
+      priceUsd: ENTRY_PRICE * 1.08, // +8% — well inside every exit rule, nothing should fire
+      priceChange: { m5: 3 },
+      liquidityUsd: 50_000,
+      timestamp: Date.now(),
+    })
+    await checkExits('solana', broker, 'early')
+
+    const entries = await readPositionTrajectoryLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      positionId: position!.id,
+      tokenAddress: 'trajTok',
+      strategy: 'early',
+      priceChangeM5: 3,
+    })
+    expect(entries[0]!['returnPct']).toBeCloseTo(8, 5)
+  })
+
+  it('still logs the final tick on a cycle that DOES trigger an exit — trajectory includes the last observed price, not just the ones before exit', async () => {
+    pairsMock.mockResolvedValue([pair({ address: 'trajExitTok', ageMinutes: 100, priceUsd: '0.10', liquidity: { usd: 50_000 } })])
+    const broker = new DexBroker({ id: 'traj-exit-test', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    await evaluateStrategy({ ...EARLY_CONFIG, useSolanaRpc: false }, 'solana', 'trajExitTok', 100, broker, pair({ address: 'trajExitTok', ageMinutes: 100 }))
+
+    vi.spyOn(priceFeed, 'getLatestPrice').mockReturnValue({
+      pairAddress: 'pair-trajExitTok',
+      priceUsd: ENTRY_PRICE * 0.70, // -30%, past the -20% stopLoss — triggers an exit this same cycle
+      priceChange: { m5: -25 },
+      liquidityUsd: 50_000,
+      timestamp: Date.now(),
+    })
+    await checkExits('solana', broker, 'early')
+
+    const entries = await readPositionTrajectoryLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!['returnPct']).toBeCloseTo(-30, 5)
+  })
+
+  it('accumulates one line per tick, keyed by positionId — reconstructing a trajectory is a groupBy + sort, not a lookup by mutable state', async () => {
+    pairsMock.mockResolvedValue([pair({ address: 'trajMultiTok', ageMinutes: 100, priceUsd: '0.10', liquidity: { usd: 50_000 } })])
+    const broker = new DexBroker({ id: 'traj-multi-test', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    await evaluateStrategy({ ...EARLY_CONFIG, useSolanaRpc: false }, 'solana', 'trajMultiTok', 100, broker, pair({ address: 'trajMultiTok', ageMinutes: 100 }))
+    const [position] = await getOpenPositions()
+
+    vi.spyOn(priceFeed, 'getLatestPrice').mockReturnValue({
+      pairAddress: 'pair-trajMultiTok', priceUsd: ENTRY_PRICE * 1.02, priceChange: { m5: 1 }, liquidityUsd: 50_000, timestamp: Date.now(),
+    })
+    await checkExits('solana', broker, 'early')
+    vi.spyOn(priceFeed, 'getLatestPrice').mockReturnValue({
+      pairAddress: 'pair-trajMultiTok', priceUsd: ENTRY_PRICE * 1.05, priceChange: { m5: 2 }, liquidityUsd: 50_000, timestamp: Date.now(),
+    })
+    await checkExits('solana', broker, 'early')
+
+    const entries = await readPositionTrajectoryLog()
+    expect(entries).toHaveLength(2)
+    expect(entries.every(e => e['positionId'] === position!.id)).toBe(true)
+    expect(entries[0]!['returnPct']).toBeCloseTo(2, 5)
+    expect(entries[1]!['returnPct']).toBeCloseTo(5, 5)
+  })
+
+  it('does NOT log for a main-loop (slow-cadence) strategy — conservative is not in the fast regime', async () => {
+    pairsMock.mockResolvedValue([pair({ address: 'trajSlowTok', ageMinutes: 400, priceUsd: '0.10', liquidity: { usd: 50_000 } })])
+    const broker = new DexBroker({ id: 'traj-slow-test', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    await evaluateStrategy({ ...CONSERVATIVE_CONFIG, requireGoPlus: false }, 'solana', 'trajSlowTok', 400, broker, pair({ address: 'trajSlowTok', ageMinutes: 400 }))
+
+    vi.spyOn(priceFeed, 'getLatestPrice').mockReturnValue({
+      pairAddress: 'pair-trajSlowTok', priceUsd: ENTRY_PRICE * 1.05, priceChange: { m5: 2 }, liquidityUsd: 50_000, timestamp: Date.now(),
+    })
+    await checkExits('solana', broker, 'conservative')
+
+    expect(await readPositionTrajectoryLog()).toHaveLength(0)
+  })
+
+  it('does not affect trading behavior — same exit decision and closedCount with or without the log', async () => {
+    pairsMock.mockResolvedValue([pair({ address: 'trajNoopTok', ageMinutes: 100, priceUsd: '0.10', liquidity: { usd: 50_000 } })])
+    const broker = new DexBroker({ id: 'traj-noop-test', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    await evaluateStrategy({ ...EARLY_CONFIG, useSolanaRpc: false }, 'solana', 'trajNoopTok', 100, broker, pair({ address: 'trajNoopTok', ageMinutes: 100 }))
+
+    vi.spyOn(priceFeed, 'getLatestPrice').mockReturnValue({
+      pairAddress: 'pair-trajNoopTok', priceUsd: ENTRY_PRICE * 0.70, priceChange: { m5: -25 }, liquidityUsd: 50_000, timestamp: Date.now(),
+    })
+    const closedCount = await checkExits('solana', broker, 'early')
+
+    expect(closedCount).toBe(1)
+    expect(await broker.getPositions()).toHaveLength(0)
   })
 })
 

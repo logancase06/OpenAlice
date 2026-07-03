@@ -953,6 +953,64 @@ export function getStopLossOvershootCount(): number {
 }
 
 /**
+ * Unblocks the staged-exit/dynamic-sizing simulation identified as this
+ * session's highest-priority next step (see data/notes/session-summary.md)
+ * — that simulation needs the full intra-hold price trajectory, not just
+ * `peakPrice` (censored for take_profit/trailing_stop exits, see that
+ * field's own censorship finding) or the sparse, incidental scan-log
+ * re-scans (median 0, only ~20% of trades with 3+ points — confirmed not
+ * exploitable retroactively). checkExits() already computes price/m5/
+ * returnPct for every fast-regime position every 5s; this was previously
+ * discarded after evaluateExitRules() ran, kept only as the single
+ * `peakPrice`/`lastCheckedPrice` scalar. Persisting it is near-zero
+ * marginal cost — no new network call, no new computation, just an append
+ * of numbers already in hand.
+ *
+ * Unconditional (every tick, not threshold-triggered like
+ * stopLossOvershootCount) — the point is to reconstruct a full trajectory
+ * per position afterwards, so a sampled or filtered log would defeat the
+ * purpose. Only applies to fast-regime strategies (`isFastExitRegimeStrategy`
+ * — same set `fastExitRegime` itself uses, currently early/early_strict/
+ * early_web_filtered/grad_immediate): the slow main-loop cadence (300s,
+ * conservative/grad_dip) is too coarse to reconstruct a staged-exit
+ * trajectory from anyway, so logging it there would just be noise.
+ *
+ * One line per tick, keyed by `positionId`, appended to a dedicated file —
+ * NOT one growing record per position updated in place. Same append-only
+ * convention as every other log in this file (appendScanLog,
+ * appendSilentDistributionLog): a pure append is a single sequential write,
+ * trivial to make crash-safe and never needs a read-modify-write cycle.
+ * Reconstructing a trajectory later is a simple groupBy(positionId) + sort
+ * by timestamp over the day's file(s) — no harder to query than the
+ * alternative, and far simpler to write correctly.
+ *
+ * Zero effect on trading decisions — logging only, same convention as
+ * stopLossOvershootCount/silent-distribution. Written to its own file
+ * (dataPath, the real `~/.openalice/data` root), not data/notes/.
+ */
+export function positionTrajectoryLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('position-trajectory', `${date}.jsonl`)
+}
+
+export interface PositionTrajectoryLogEntry {
+  positionId: string
+  tokenAddress: string
+  symbol: string
+  strategy: StrategyLabel
+  timestamp: string
+  price: number
+  priceChangeM5?: number
+  returnPct: number
+  holdingMinutes: number
+}
+
+export async function appendPositionTrajectoryLog(entry: PositionTrajectoryLogEntry): Promise<void> {
+  const filePath = positionTrajectoryLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
+/**
  * Runs exit evaluation for every open position of one strategy. Returns how
  * many closed this call.
  *
@@ -981,10 +1039,24 @@ export async function checkExits(chain: DexChain, broker: DexBroker, strategy: S
       console.warn(`live-scan: ${position.symbol} — prix stale (>10s, dernier update il y a ${((Date.now() - price.timestamp) / 1000).toFixed(1)}s)`)
     }
 
+    const returnPct = ((price.priceUsd - position.entryPrice) / position.entryPrice) * 100
+    if (isFastExitRegimeStrategy(strategy)) {
+      await appendPositionTrajectoryLog({
+        positionId: position.id,
+        tokenAddress: position.tokenAddress,
+        symbol: position.symbol,
+        strategy: position.strategy,
+        timestamp: new Date().toISOString(),
+        price: price.priceUsd,
+        priceChangeM5: price.priceChange.m5,
+        returnPct,
+        holdingMinutes: (Date.now() - position.entryTimestamp) / 60_000,
+      })
+    }
+
     const reason = evaluateExitRules(position, price.priceUsd, price.liquidityUsd, price.priceChange.m5)
     if (reason) {
       if (reason === 'stop_loss') {
-        const returnPct = ((price.priceUsd - position.entryPrice) / position.entryPrice) * 100
         const overshootPp = position.exitConfig.stopLoss - returnPct // positive = worse than configured threshold
         if (overshootPp > STOP_LOSS_OVERSHOOT_ALERT_PP) {
           stopLossOvershootCount++
