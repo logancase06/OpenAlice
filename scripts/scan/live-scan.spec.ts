@@ -75,6 +75,7 @@ import {
   CONSERVATIVE_CONFIG,
   EARLY_CONFIG,
   EARLY_STRICT_CONFIG,
+  EARLY_WEB_FILTERED_CONFIG,
   EARLY_EXIT_CONFIG,
   SCALP_EXIT_CONFIG,
   runLiveScan,
@@ -91,7 +92,9 @@ import {
   handleGradDip,
   GRAD_IMMEDIATE_EXIT_CONFIG,
   GRAD_DIP_EXIT_CONFIG,
+  GRAD_DIP_CONFIG,
   GRAD_IMMEDIATE_ENTRY_SUSPENDED,
+  GRAD_DIP_ENTRY_SUSPENDED,
   type StrategyRuntime,
 } from './live-scan.js'
 import type { PumpFunToken } from '../../services/uta/src/domain/trading/brokers/dex/pump-fun-feed.js'
@@ -811,6 +814,18 @@ describe('evaluateStrategy — fastExitRegime stamping', () => {
     expect(positions.find(p => p.tokenAddress === 'fastRegimeStrictTok')?.fastExitRegime).toBe(true)
   })
 
+  it('stamps fastExitRegime: true on an EARLY_WEB_FILTERED buy', async () => {
+    const candidate = pair({ address: 'fastRegimeWebTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 }, info: { websites: [{ url: 'https://example.com' }] } })
+    pairsMock.mockResolvedValue([candidate])
+    const broker = new DexBroker({ id: 'fast-regime-web-filtered', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+
+    await evaluateStrategy({ ...EARLY_WEB_FILTERED_CONFIG, useSolanaRpc: false }, 'solana', 'fastRegimeWebTok', 100, broker, candidate)
+
+    const positions = await getOpenPositions()
+    expect(positions.find(p => p.tokenAddress === 'fastRegimeWebTok')?.fastExitRegime).toBe(true)
+  })
+
   it('leaves fastExitRegime undefined on a CONSERVATIVE buy — not in the fast regime', async () => {
     pairsMock.mockResolvedValue([pair({ address: 'slowRegimeTok', ageMinutes: 400, priceUsd: '0.05', liquidity: { usd: 50_000 } })])
     const broker = new DexBroker({ id: 'slow-regime', chain: 'solana', paper: true, paperCashUsd: 1000 })
@@ -820,6 +835,38 @@ describe('evaluateStrategy — fastExitRegime stamping', () => {
 
     const positions = await getOpenPositions()
     expect(positions.find(p => p.tokenAddress === 'slowRegimeTok')?.fastExitRegime).toBeUndefined()
+  })
+})
+
+describe('EARLY_WEB_FILTERED_CONFIG', () => {
+  it('isolates requireWebsite as the ONLY difference from EARLY_CONFIG — guards against accidentally stacking EARLY_STRICT-style filters onto it', () => {
+    expect(EARLY_WEB_FILTERED_CONFIG.label).toBe('early_web_filtered')
+    expect(EARLY_WEB_FILTERED_CONFIG.requireWebsite).toBe(true)
+    expect({ ...EARLY_WEB_FILTERED_CONFIG, label: EARLY_CONFIG.label, requireWebsite: undefined })
+      .toEqual({ ...EARLY_CONFIG, requireWebsite: undefined })
+  })
+
+  it('rejects a candidate with no website listed', async () => {
+    const broker = new DexBroker({ id: 'web-filtered-reject', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    const candidate = pair({ address: 'noWebsiteTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 } }) // no `info` at all
+
+    const decision = await evaluateStrategy({ ...EARLY_WEB_FILTERED_CONFIG, useSolanaRpc: false }, 'solana', 'noWebsiteTok', 100, broker, candidate)
+
+    expect(decision.pass).toBe(false)
+    expect(decision.reason).toMatch(/no website listed/i)
+    expect(await broker.getPositions()).toHaveLength(0)
+  })
+
+  it('buys a candidate with a website listed, same as EARLY otherwise would', async () => {
+    const broker = new DexBroker({ id: 'web-filtered-buy', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    const candidate = pair({ address: 'hasWebsiteTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 }, info: { websites: [{ url: 'https://example.com' }] } })
+
+    const decision = await evaluateStrategy({ ...EARLY_WEB_FILTERED_CONFIG, useSolanaRpc: false }, 'solana', 'hasWebsiteTok', 100, broker, candidate)
+
+    expect(decision.pass).toBe(true)
+    expect(await broker.getPositions()).toHaveLength(1)
   })
 })
 
@@ -1134,6 +1181,61 @@ describe('handleGradDip', () => {
 
     expect(result).toEqual({ watched: 0, bought: 0 })
     expect(pairForMintMock).not.toHaveBeenCalled()
+  })
+
+  async function seedDipCandidate(tracker: InstanceType<typeof GraduatedTokensTracker>, mint: string) {
+    await tracker.add({ mintAddress: mint, graduatedAt: Date.now(), signature: 'sig-dip', source: 'helius_logs' })
+    await tracker.updatePrice(mint, 1.0, 50_000) // sets peak at 1.0
+    await tracker.updatePrice(mint, 0.6, 50_000) // -40% from peak — inside the -25%/-60% dip band
+  }
+
+  it('buys a fresh dip candidate when no position is already open on it', async () => {
+    const broker = new DexBroker({ id: 'test-grad-dip-buy', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    const tracker = new GraduatedTokensTracker()
+    await seedDipCandidate(tracker, 'dipTok')
+    pairForMintMock.mockResolvedValue(pair({ address: 'dipTok', ageMinutes: 30, priceUsd: '0.6', liquidity: { usd: 50_000 }, priceChange: { m5: 5 }, volume: { h1: 1000 } }))
+    mintAuthorityMock.mockResolvedValue({ hasMintAuthority: false, hasFreezeAuthority: false, decimals: 6, supply: '0', mintAddress: 'dipTok', fromCache: false, rpcAvailable: true })
+
+    const result = await handleGradDip('solana', broker, tracker)
+
+    expect(result).toEqual({ watched: 1, bought: 1 })
+    expect(await broker.getPositions()).toHaveLength(1)
+  })
+
+  it('fixed 2026-07-03: skips a dip candidate it already holds an open position on — no duplicate/overlapping buy', async () => {
+    const broker = new DexBroker({ id: 'test-grad-dip-dedup', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    const tracker = new GraduatedTokensTracker()
+    await seedDipCandidate(tracker, 'dipTok')
+    pairForMintMock.mockResolvedValue(pair({ address: 'dipTok', ageMinutes: 30, priceUsd: '0.6', liquidity: { usd: 50_000 }, priceChange: { m5: 5 }, volume: { h1: 1000 } }))
+    mintAuthorityMock.mockResolvedValue({ hasMintAuthority: false, hasFreezeAuthority: false, decimals: 6, supply: '0', mintAddress: 'dipTok', fromCache: false, rpcAvailable: true })
+
+    // Pre-existing open position on the same mint — as if a prior handleGradDip
+    // cycle already bought this dip and it hasn't exited yet. hasOpenPosition()
+    // reads the BROKER's own state, not position-tracker.ts's file records
+    // directly, so restoreOpenPositions() is needed to hydrate it — same
+    // pattern as the "prevents a duplicate buy on a token restored from a
+    // previous session" test above.
+    await openPosition(pair({ address: 'dipTok', ageMinutes: 30, priceUsd: '0.6' }), 'grad_dip', 0.6, 30, GRAD_DIP_EXIT_CONFIG)
+    await restoreOpenPositions([{ config: GRAD_DIP_CONFIG, broker }])
+
+    const result = await handleGradDip('solana', broker, tracker)
+
+    expect(result).toEqual({ watched: 1, bought: 0 })
+    // Exactly 1 call: handleGradDip's own price-refresh pass over every
+    // tracked token (unconditional, runs before the dip-candidate loop).
+    // The hasOpenPosition() guard sits inside that later loop and must
+    // fire BEFORE its own fetchPairForMint call — so still 1, not 2, proves
+    // the guard is a genuine early skip rather than a later check failing.
+    expect(pairForMintMock).toHaveBeenCalledTimes(1)
+    expect(await broker.getPositions()).toHaveLength(1)
+  })
+})
+
+describe('GRAD_DIP_ENTRY_SUSPENDED', () => {
+  it('is true (2026-07-03, no positive signal on clean n=33/12 independent tokens) — pinned so a silent flip back is caught here rather than discovered live', () => {
+    expect(GRAD_DIP_ENTRY_SUSPENDED).toBe(true)
   })
 })
 

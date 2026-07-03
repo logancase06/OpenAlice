@@ -262,6 +262,55 @@ describe('checkTokenSecurity existingPair reuse', () => {
   })
 })
 
+describe('checkTokenSecurity requireWebsite (EARLY_WEB_FILTERED_CONFIG)', () => {
+  const CLEAN_GOPLUS_DATA = { mintable: { status: '0' }, freezable: { status: '0' } }
+  function pairWithWebsite(websites: Array<{ url: string; label?: string }> | undefined): DexScreenerPair {
+    return {
+      chainId: 'solana',
+      pairAddress: 'pair-web',
+      baseToken: { address: 'webMint', symbol: 'WEB', name: 'Web Coin' },
+      quoteToken: { address: 'sol', symbol: 'SOL', name: 'Wrapped SOL' },
+      liquidity: { usd: 20_000 },
+      info: websites === undefined ? undefined : { websites },
+    }
+  }
+
+  it('rejects a token with no website when requireWebsite is true', async () => {
+    fetchSpy.mockImplementation(async () => goPlusResponse('solana', 'webMint', CLEAN_GOPLUS_DATA))
+
+    const result = await checkTokenSecurity('solana', 'webMint', { requireWebsite: true }, pairWithWebsite([]))
+
+    expect(result.passed).toBe(false)
+    expect(result.reasons.join(' ')).toMatch(/no website listed/i)
+  })
+
+  it('rejects when pair.info itself is absent (no website data at all) — missing data fails safe here, unlike other DexScreener checks', async () => {
+    fetchSpy.mockImplementation(async () => goPlusResponse('solana', 'webMint', CLEAN_GOPLUS_DATA))
+
+    const result = await checkTokenSecurity('solana', 'webMint', { requireWebsite: true }, pairWithWebsite(undefined))
+
+    expect(result.passed).toBe(false)
+    expect(result.reasons.join(' ')).toMatch(/no website listed/i)
+  })
+
+  it('passes a token with a website listed when requireWebsite is true', async () => {
+    fetchSpy.mockImplementation(async () => goPlusResponse('solana', 'webMint', CLEAN_GOPLUS_DATA))
+
+    const result = await checkTokenSecurity('solana', 'webMint', { requireWebsite: true }, pairWithWebsite([{ url: 'https://example.com' }]))
+
+    expect(result.passed).toBe(true)
+    expect(result.reasons).toEqual([])
+  })
+
+  it('skips the check entirely when requireWebsite is unset — a website-less token still passes', async () => {
+    fetchSpy.mockImplementation(async () => goPlusResponse('solana', 'webMint', CLEAN_GOPLUS_DATA))
+
+    const result = await checkTokenSecurity('solana', 'webMint', {}, pairWithWebsite([]))
+
+    expect(result.passed).toBe(true)
+  })
+})
+
 describe('checkTokenSecurity minLiquidityUsd', () => {
   // Only this describe block enables minLiquidityUsd, so every other test
   // above is unaffected (the liquidity fetch is gated by config presence —

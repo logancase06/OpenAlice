@@ -34,11 +34,14 @@ export interface DexScreenerPair {
   url?: string
   /**
    * Social/website links and paid-promotion status — confirmed present in
-   * DexScreener's real API response (verified live 2026-07-02) but not used
-   * in any filter yet. Presence alone was a weak signal on the sample
-   * checked that session (rugs 8/11 had socials, 72.7% — winners 13/14,
-   * 92.9% — not a clean separator), so this is captured for accumulation
-   * into scan-log, not wired into any guard.
+   * DexScreener's real API response (verified live 2026-07-02). `socials`
+   * presence alone was a weak signal on the small sample checked that
+   * session (rugs 72.7% had socials, winners 92.9% — not a clean separator)
+   * and stayed weak at n=674 (rugs 100%, winners 97.6% — the field is
+   * present on ~97% of tokens regardless of outcome, too little variance to
+   * discriminate on). `websites` presence, in contrast, held up on a larger
+   * sample — see `TokenSecurityGuard.ts`'s `requireWebsite` for the guard
+   * this backs and its full evidence/caveats.
    */
   info?: {
     websites?: Array<{ url: string; label?: string }>

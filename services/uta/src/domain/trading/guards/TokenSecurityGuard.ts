@@ -159,6 +159,25 @@ export interface TokenSecurityConfig {
    * other strategy.
    */
   minBootstrappedSignals?: number
+  /**
+   * Reject if the DexScreener pair has no website listed (`pair.info.websites`
+   * empty/absent) — see `EARLY_WEB_FILTERED_CONFIG` in live-scan.ts for the
+   * strategy this backs and its full numeric justification. Unset/false ⇒
+   * check skipped entirely.
+   *
+   * Retrospective evidence (2026-07-03, n=620 EARLY+EARLY_STRICT trades with
+   * the field resolvable): rejecting `hasWebsite=false` candidates cut
+   * average return from -1.21pp to +0.11pp on the retained set, at the cost
+   * of rejecting ~49% of volume. BUT the underlying base rate of
+   * `hasWebsite=true` swung from 30.4% to 61.9% across chronological
+   * quartiles of that same sample, and quartile-level outcomes reversed
+   * direction twice (Q1 rug rate, Q2 avg return) even though the coarser
+   * 2-half split looked clean. Treat this as a promising but NOT yet
+   * confirmed signal — hence a separate parallel strategy
+   * (`early_web_filtered`) rather than a change to EARLY/EARLY_STRICT
+   * themselves.
+   */
+  requireWebsite?: boolean
 }
 
 export interface TokenSecurityResult {
@@ -465,6 +484,23 @@ function checkVolumeLiquidityRatio(pair: DexScreenerPair | null, cfg: TokenSecur
   return reasons
 }
 
+/** Reject if the pair lists no website (`pair.info.websites`) — see `requireWebsite`'s docstring for the evidence and its caveats. No `pair` at all (total fetch failure) ⇒ skipped; an absent/empty `info.websites` on a resolved pair ⇒ rejected (that absence IS the signal, not missing data). */
+function checkWebsitePresence(pair: DexScreenerPair | null, cfg: TokenSecurityConfig): string[] {
+  if (!cfg.requireWebsite) return []
+  // Unlike the "missing data ⇒ skip" convention used by checkMomentum/
+  // checkOverextension/etc. (where absence means "DexScreener hasn't
+  // populated this window yet, we genuinely don't know"), a missing `pair`
+  // entirely (total fetch failure) still skips — but an absent/empty
+  // `info.websites` on an otherwise-resolved pair IS the signal itself: a
+  // token with no configured website looks identical to one DexScreener
+  // simply omitted `info` for, and `requireWebsite`'s whole point is to
+  // reject that case, not treat it as inconclusive.
+  if (!pair) return []
+  const hasWebsite = (pair.info?.websites?.length ?? 0) > 0
+  if (!hasWebsite) return ['No website listed for this token (requireWebsite)']
+  return []
+}
+
 /** Heuristic symbol/name scam-pattern reject (see dex-name-filter.ts). No pair/symbol data ⇒ skipped, not rejected. */
 function checkNameFilter(pair: DexScreenerPair | null, cfg: TokenSecurityConfig): string[] {
   if (cfg.maxNameRiskScore == null) return []
@@ -627,6 +663,7 @@ export async function checkTokenSecurity(
   reasons.push(...checkOverextension(pair, config, bootstrappedSignalCount))
   reasons.push(...checkVolumeLiquidityRatio(pair, config))
   reasons.push(...checkNameFilter(pair, config))
+  reasons.push(...checkWebsitePresence(pair, config))
   reasons.push(...await checkWalletSignal(chain, tokenAddress, config))
   reasons.push(...checkBootstrappedSignalRequirement(config, bootstrappedSignalCount))
 

@@ -175,6 +175,59 @@ export const EARLY_STRICT_CONFIG: StrategyConfig = {
   maxPriceChangePct1h: 150,
 }
 
+/**
+ * Adopted 2026-07-03 — EARLY plus exactly ONE additional filter
+ * (`requireWebsite`), deliberately built on `EARLY_CONFIG` rather than
+ * `EARLY_STRICT_CONFIG` so this strategy isolates the `hasWebsite` variable
+ * on its own. Stacking it onto EARLY_STRICT's liquidity/overextension
+ * filters would have reproduced the exact confusion this session already
+ * hit once (GRAD_IMMEDIATE's liquidity-floor test) and corrected for: with
+ * two filters changing at once, a live result couldn't be attributed to
+ * either one specifically.
+ *
+ * Retrospective evidence (n=620 EARLY+EARLY_STRICT trades with `hasWebsite`
+ * resolvable via scan-log, 2026-07-02/03): rejecting `hasWebsite=false`
+ * candidates would have cut the retained set's average return from -1.21pp
+ * to +0.11pp (EARLY alone: -1.00pp -> +0.44pp; EARLY_STRICT alone: -1.56pp
+ * -> -0.43pp, stays negative even filtered) — at the cost of rejecting
+ * ~49% of volume that already passes EARLY/EARLY_STRICT's own filters.
+ *
+ * Evidence is NOT clean enough to apply directly to EARLY/EARLY_STRICT,
+ * which is why this is a separate parallel strategy instead. A 2-half
+ * chronological walk-forward looked solid, but a finer QUARTILE split (4
+ * windows instead of 2) revealed real instability the coarser split
+ * masked:
+ *   - hasWebsite=true's own base rate swung 30.4% -> 61.9% -> 46.4% -> 61.8%
+ *     across the 4 quartiles — not stable, and not explained away yet
+ *     (could be a real signal drifting with the creator population, or
+ *     just noise at ~168 trades/quartile — not distinguished here).
+ *   - Outcome direction reversed locally twice: Q1's rug rate favored
+ *     hasWebsite=FALSE (4.3% vs 9.8%), and Q2's avg return favored
+ *     hasWebsite=FALSE (-2.95pp vs -5.63pp) — both opposite the overall
+ *     trend. 3 of 4 quartiles still favored hasWebsite=true on avg return,
+ *     so the effect isn't dead, but it's noisier than the clean 2-half
+ *     split suggested.
+ *   - Methodological note for future signal validation in this project:
+ *     ALWAYS check a finer split (quartiles, not just halves) before
+ *     trusting a 2-half walk-forward — see data/notes/session-summary.md's
+ *     methodology section, added alongside this decision.
+ *
+ * Field coverage confirmed 100% on live scans as of 2026-07-03 (1987/1987
+ * same-day scan-log entries, last 200 real-time scans) — not a data-
+ * availability concern, purely a signal-robustness one.
+ *
+ * Reopen threshold to promote this into an actual EARLY/EARLY_STRICT
+ * filter: n>=30 trades under THIS strategy in real conditions (not the
+ * retrospective join), AND a quartile split (not just a 2-half one) on
+ * that live sample showing no direction reversal — the bar this decision
+ * itself was held to.
+ */
+export const EARLY_WEB_FILTERED_CONFIG: StrategyConfig = {
+  ...EARLY_CONFIG,
+  label: 'early_web_filtered',
+  requireWebsite: true,
+}
+
 // COPY_WALLET exit config, adopted 2026-07-02 alongside the preset below —
 // tighter and faster than EARLY_EXIT_CONFIG on the premise that a wallet
 // with a real, independently-measured track record (wallet-bootstrapper.ts)
@@ -269,9 +322,11 @@ export const GRAD_IMMEDIATE_CONFIG: StrategyConfig = {
  * its live trigger (the onGraduation callback in runLiveScan, see
  * GRAD_IMMEDIATE_ENTRY_SUSPENDED's usage there) is gated off, so the
  * strategy stays backtestable/re-runnable once a real entry-quality
- * criterion replaces the blind-buy check set. GRAD_DIP is unaffected (no
- * equivalent walk-forward failure found for it — see FAST_EXIT_CHECK_INTERVAL_MS's
- * docstring) and keeps running normally.
+ * criterion replaces the blind-buy check set. GRAD_DIP was suspended
+ * separately on 2026-07-03 for a different reason — see
+ * GRAD_DIP_ENTRY_SUSPENDED's own docstring, the two must not be conflated:
+ * this one is a walk-forward SIGN REVERSAL (degrading over time), GRAD_DIP's
+ * is a flat absence of any positive signal (no reversal, no degradation).
  */
 export const GRAD_IMMEDIATE_ENTRY_SUSPENDED = true
 
@@ -280,6 +335,52 @@ export const GRAD_DIP_CONFIG: StrategyConfig = {
   minAgeMinutes: 0,
   exitConfig: GRAD_DIP_EXIT_CONFIG,
 }
+
+/**
+ * Suspended 2026-07-03 — entry only, not the strategy itself, same pattern
+ * as GRAD_IMMEDIATE_ENTRY_SUSPENDED but a DIFFERENT diagnosis, documented
+ * precisely so the two aren't conflated:
+ *
+ * Raw trade history showed n=50 across only 12 unique tokens (~4.2
+ * trades/token) — investigation found `handleGradDip()` never checked
+ * `hasOpenPosition()` before buying (unlike evaluateStrategy()'s buy path),
+ * so a token sitting in the -25%/-60% dip band across consecutive 30s
+ * cycles got bought repeatedly, stacking concurrent positions on the same
+ * mint (confirmed: up to 4 simultaneous open positions on one mint, Anthar,
+ * 2026-07-02 20:25-23:37). Fixed by adding the missing `hasOpenPosition()`
+ * guard (see handleGradDip below) — 17 of the 50 trades (34%) were
+ * duplicate buys this guard would have blocked.
+ *
+ * Re-diagnosed on the CLEAN n=33 (guard simulated retroactively, still 12
+ * independent tokens): -12.55pp average, walk-forward split by token (not
+ * by trade — a token is assigned entirely to one half by its first-seen
+ * date, so it can't straddle both) gives 1st half -11.77pp (6 tokens, n=20)
+ * and 2nd half -13.75pp (6 tokens, n=13). Unlike GRAD_IMMEDIATE, THIS
+ * WALK-FORWARD DOES NOT REVERSE SIGN and shows no meaningful degradation —
+ * it's flat and negative across the whole observed period. The diagnosis
+ * here is a plain absence of positive signal on the available sample, not a
+ * strategy that's actively getting worse. Also unlike GRAD_IMMEDIATE, the
+ * dedup bug materially inflated the raw trade count (34% of trades were
+ * spurious duplicates) — fixing it changed the trade count and rug rate,
+ * but not the sign or rough magnitude of the average return (-12.09pp raw
+ * vs -12.55pp clean).
+ *
+ * Reopen threshold: either a materially larger independent-token sample
+ * (12 is still thin — most of that n=33 comes from just a few tokens with
+ * multiple sequential, mostly uncorrelated re-entries, see
+ * data/notes/token-registry.json's per-token consistency finding: only
+ * 1.5% of repeat-buy tokens win twice in a row), or a redesigned entry
+ * criterion (separate design work, not a threshold retune — GRAD_DIP's
+ * checks are already closer to EARLY's than GRAD_IMMEDIATE's blind buy was,
+ * so the fix here isn't "add a missing guard" the way GRAD_IMMEDIATE's
+ * would be).
+ *
+ * `handleGradDip` itself is left fully intact and unit-tested (including
+ * the hasOpenPosition() dedup fix) — only its live trigger (the call site
+ * in runLiveScan's main loop) is gated off, so the strategy stays
+ * backtestable/re-runnable.
+ */
+export const GRAD_DIP_ENTRY_SUSPENDED = true
 
 export const MOMENTUM_CONFIG: StrategyConfig = {
   label: 'momentum',
@@ -441,6 +542,7 @@ export interface ScanLogEntry {
   momentum: StrategyDecision
   scalp_momentum: StrategyDecision
   early_strict: StrategyDecision
+  early_web_filtered: StrategyDecision
   velocityContext: { tokensPerHour: number; trend: MarketVelocity['trend'] }
   walletSignals: WalletSignal[]
   nameFilter: { riskScore: number; flags: string[] }
@@ -782,7 +884,7 @@ export interface ScanStats {
 }
 
 export function freshStats(): ScanStats {
-  return { cycles: 0, scanned: 0, passed: { conservative: 0, early: 0, momentum: 0, scalp_momentum: 0, early_strict: 0, copy_wallet: 0, grad_immediate: 0, grad_dip: 0 } }
+  return { cycles: 0, scanned: 0, passed: { conservative: 0, early: 0, momentum: 0, scalp_momentum: 0, early_strict: 0, early_web_filtered: 0, copy_wallet: 0, grad_immediate: 0, grad_dip: 0 } }
 }
 
 /**
@@ -908,6 +1010,7 @@ export async function runScanPhase(
       momentum: decisions.momentum ?? { pass: false, reason: 'not evaluated' },
       scalp_momentum: decisions.scalp_momentum ?? { pass: false, reason: 'not evaluated' },
       early_strict: decisions.early_strict ?? { pass: false, reason: 'not evaluated' },
+      early_web_filtered: decisions.early_web_filtered ?? { pass: false, reason: 'not evaluated' },
       velocityContext: { tokensPerHour: velocity.tokensPerHour, trend: velocity.trend },
       walletSignals,
       nameFilter: { riskScore: nameFilter.riskScore, flags: nameFilter.flags },
@@ -1216,8 +1319,11 @@ const FAST_EXIT_CHECK_INTERVAL_MS = 5_000
  * Single source of truth for both `openPosition`'s `fastExitRegime` stamp
  * (evaluateStrategy's buy path and executeGradBuy) and runLiveScan's own
  * strategy-list split, so the two can never drift out of sync.
+ * `early_web_filtered` included from its adoption (2026-07-03) — same
+ * crash-speed risk applies regardless of its entry filter, see
+ * EARLY_WEB_FILTERED_CONFIG's docstring.
  */
-const FAST_EXIT_REGIME_LABELS: ReadonlySet<StrategyLabel> = new Set(['early', 'early_strict', 'grad_immediate'])
+const FAST_EXIT_REGIME_LABELS: ReadonlySet<StrategyLabel> = new Set(['early', 'early_strict', 'early_web_filtered', 'grad_immediate'])
 
 function isFastExitRegimeStrategy(label: StrategyLabel): boolean {
   return FAST_EXIT_REGIME_LABELS.has(label)
@@ -1346,6 +1452,17 @@ export async function handleGradDip(
   let boughtCount = 0
 
   for (const token of candidates) {
+    // Fixed 2026-07-03: getEligibleForDip() is a pure price-range filter with
+    // no memory of prior buys, and (unlike evaluateStrategy()'s buy path)
+    // this loop never checked hasOpenPosition() before executeGradBuy() — so
+    // a token sitting in the -25%/-60% dip band across consecutive 30s
+    // cycles got bought again on every cycle, stacking concurrent positions
+    // on the same mint instead of one buy followed by a real re-entry after
+    // that position closed. Confirmed live: 8 tokens with overlapping
+    // (not just repeated) entry/exit windows, up to 4 simultaneous open
+    // positions on the same mint (Anthar, 2026-07-02 20:25-23:37).
+    if (await hasOpenPosition(broker, token.mintAddress)) continue
+
     const pair = await fetchPairForMint(token.mintAddress, chain)
     if (!pair) continue
 
@@ -1580,7 +1697,7 @@ export function parseArgs(argv: string[]): { chain: DexChain; intervalSeconds: n
 
 export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promise<void> {
   const { chain, intervalSeconds, scanIntervalSeconds } = parseArgs(argv)
-  console.log(`live-scan: starting on chain=${chain}, exit-check interval=${intervalSeconds}s, new-token scan interval=${scanIntervalSeconds}s (paper mode, 3 strategies)`)
+  console.log(`live-scan: starting on chain=${chain}, exit-check interval=${intervalSeconds}s, new-token scan interval=${scanIntervalSeconds}s (paper mode, 4 strategies)`)
   console.log(process.env['HELIUS_API_KEY'] ? 'RPC: Helius (dedicated)' : 'RPC: Solana public (rate-limited — set HELIUS_API_KEY)')
   // process.pid is Node's own real OS PID — unlike a bash `$!` for a directly
   // exec'd native process on Windows/Git-Bash, this is always accurate.
@@ -1593,7 +1710,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   priceFeed.setChain(chain)
   console.log('Price feed   : Batch HTTP toutes les 3s')
   console.log(`Exit checker : every ${intervalSeconds}s (lecture cache) — conservative, grad_dip`)
-  console.log(`Exit checker (fast) : every ${FAST_EXIT_CHECK_INTERVAL_MS / 1000}s (lecture cache, coût réseau nul) — early, early_strict, grad_immediate`)
+  console.log(`Exit checker (fast) : every ${FAST_EXIT_CHECK_INTERVAL_MS / 1000}s (lecture cache, coût réseau nul) — early, early_strict, early_web_filtered, grad_immediate`)
   console.log(`Token scanner: every ${scanIntervalSeconds}s`)
   console.log('Pump.fun feed : pumpportal.fun (third-party relay)')
   console.log('              ⚠ Not affiliated with pump.fun')
@@ -1610,11 +1727,13 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   const conservativeBroker = new DexBroker({ id: `scan-conservative-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const earlyBroker = new DexBroker({ id: `scan-early-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const earlyStrictBroker = new DexBroker({ id: `scan-early-strict-${chain}`, chain, paper: true, paperCashUsd: 1000 })
+  const earlyWebFilteredBroker = new DexBroker({ id: `scan-early-web-filtered-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const gradImmediateBroker = new DexBroker({ id: `scan-grad-immediate-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const gradDipBroker = new DexBroker({ id: `scan-grad-dip-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   await conservativeBroker.init()
   await earlyBroker.init()
   await earlyStrictBroker.init()
+  await earlyWebFilteredBroker.init()
   await gradImmediateBroker.init()
   await gradDipBroker.init()
 
@@ -1622,7 +1741,8 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   await graduatedTracker.load()
   console.log(`Graduated tracker: ${graduatedTracker.getAll().length} tokens (loaded from active.json)`)
   console.log(`GRAD_IMMEDIATE   : ${GRAD_IMMEDIATE_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-02, negative expectancy — see GRAD_IMMEDIATE_ENTRY_SUSPENDED docstring); exits for existing positions still active' : heliusKeyPresent ? `enabled (${GRAD_IMMEDIATE_POST_GRAD_DELAY_MS / 1000}s delay post-graduation)` : 'disabled — needs Graduation feed'}`)
-  console.log('GRAD_DIP         : enabled (25-60% dip from peak)')
+  console.log(`GRAD_DIP         : ${GRAD_DIP_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-03, no positive signal on clean n=33/12 tokens — see GRAD_DIP_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled (25-60% dip from peak)'}`)
+  console.log('EARLY_WEB_FILTERED : enabled, parallel pilot (requireWebsite, EARLY otherwise unchanged) — see EARLY_WEB_FILTERED_CONFIG docstring for the quartile-instability caveat and n≥30+quartile reopen threshold')
 
   // EARLY_STRICT replaces SCALP_MOMENTUM_CONFIG here — see EARLY_STRICT_CONFIG's
   // docstring for why (SCALP stayed at 0/120 passes even after relaxing its
@@ -1637,6 +1757,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
     { config: CONSERVATIVE_CONFIG, broker: conservativeBroker },
     { config: EARLY_CONFIG, broker: earlyBroker },
     { config: EARLY_STRICT_CONFIG, broker: earlyStrictBroker },
+    { config: EARLY_WEB_FILTERED_CONFIG, broker: earlyWebFilteredBroker },
   ]
   // Kept separate from `strategies` — never passed to runScanPhase, so
   // GRAD_IMMEDIATE/GRAD_DIP are never evaluated against the generic
@@ -1801,7 +1922,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
         await checkHeliusPoolWatchlist(chain)
         lastHeliusWatchlistCheck = Date.now()
       }
-      if (Date.now() - lastGradDipCheck >= GRAD_DIP_CHECK_INTERVAL_MS) {
+      if (!GRAD_DIP_ENTRY_SUSPENDED && Date.now() - lastGradDipCheck >= GRAD_DIP_CHECK_INTERVAL_MS) {
         await handleGradDip(chain, gradDipBroker, graduatedTracker)
         lastGradDipCheck = Date.now()
       }
@@ -1820,7 +1941,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
       await logSummary('hourly', strategies, stats, heliusPoolFeed, gradStrategies, graduatedTracker)
       stats.cycles = 0
       stats.scanned = 0
-      stats.passed = { conservative: 0, early: 0, momentum: 0, scalp_momentum: 0, early_strict: 0, copy_wallet: 0, grad_immediate: 0, grad_dip: 0 }
+      stats.passed = { conservative: 0, early: 0, momentum: 0, scalp_momentum: 0, early_strict: 0, early_web_filtered: 0, copy_wallet: 0, grad_immediate: 0, grad_dip: 0 }
       stopLossOvershootCount = 0
       lastHourlyLog = Date.now()
     }
