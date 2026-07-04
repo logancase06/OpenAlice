@@ -776,6 +776,84 @@ export async function appendVolLiquidityRatioLog(entry: VolLiquidityRatioLogEntr
   await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
 }
 
+// ==================== Post-graduation trajectory observability (2026-07-04) ====================
+// Built to unblock the post-graduation limit-order-ladder question (see
+// session-summary.md §1.15): the retroactive diagnostic had only 24 usable
+// tokens at ~5-6min tick granularity, sourced from scan-log re-sightings and
+// our own open-position trajectories — a population biased toward tokens our
+// strategies picked (48% coverage of known graduations). This logger removes
+// that bias by ticking EVERY token the graduated tracker holds (every Migrate
+// event lands there via onGraduation, independent of any buy), for the first
+// 4 hours after graduation, at a 60s sampling cadence.
+//
+// Deliberately independent of GRAD_DIP_ENTRY_SUSPENDED: before this existed,
+// the only price-refresh pass over graduated tokens lived inside
+// handleGradDip(), whose main-loop call is gated on that suspension flag —
+// so suspending the strategy silently killed the tracker's price updates
+// (and its cleanup()) too. This handler now owns the always-on refresh;
+// if GRAD_DIP is ever re-enabled, its own refresh pass becomes a redundant
+// (but harmless) duplicate fetch at 30s cadence.
+//
+// Requires the Helius graduation feed to actually populate the tracker — with
+// no HELIUS_API_KEY this logs nothing, because nothing detects graduations.
+const POST_GRAD_TRAJECTORY_INTERVAL_MS = 60_000
+const POST_GRAD_TRAJECTORY_WINDOW_MS = 4 * 60 * 60_000
+
+interface PostGradTrajectoryLogEntry {
+  timestamp: string
+  mintAddress: string
+  symbol?: string
+  priceUsd: number
+  liquidityUsd: number
+  minutesSinceGraduation: number
+}
+
+export function postGradTrajectoryLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('post-graduation-trajectory', `${date}.jsonl`)
+}
+
+export async function appendPostGradTrajectoryLog(entry: PostGradTrajectoryLogEntry): Promise<void> {
+  const filePath = postGradTrajectoryLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
+/**
+ * Ticks every tracked graduated token still inside the 4h observation
+ * window: refreshes the tracker's price state (peak/current, so
+ * getEligibleForDip() stays meaningful even while GRAD_DIP is suspended)
+ * and appends one trajectory line per token to the dated JSONL log.
+ * Tokens between 4h and the tracker's own 6h retention stay tracked but
+ * are not fetched — the ladder question only needs 4h of trajectory, and
+ * skipping them keeps the DexScreener call count bounded.
+ */
+export async function handlePostGradTrajectory(
+  chain: DexChain,
+  tracker: GraduatedTokensTracker,
+): Promise<{ tracked: number; logged: number }> {
+  await tracker.cleanup()
+  const now = Date.now()
+  const withinWindow = tracker.getAll().filter(t => now - t.graduatedAt <= POST_GRAD_TRAJECTORY_WINDOW_MS)
+  let logged = 0
+  for (const token of withinWindow) {
+    const pair = await fetchPairForMint(token.mintAddress, chain)
+    if (!pair) continue
+    const price = Number(pair.priceUsd ?? 0)
+    if (!Number.isFinite(price) || price <= 0) continue
+    await tracker.updatePrice(token.mintAddress, price, pair.liquidity?.usd ?? 0, { pairAddress: pair.pairAddress })
+    await appendPostGradTrajectoryLog({
+      timestamp: new Date(now).toISOString(),
+      mintAddress: token.mintAddress,
+      symbol: token.symbol ?? pair.baseToken.symbol,
+      priceUsd: price,
+      liquidityUsd: pair.liquidity?.usd ?? 0,
+      minutesSinceGraduation: (now - token.graduatedAt) / 60_000,
+    })
+    logged++
+  }
+  return { tracked: withinWindow.length, logged }
+}
+
 // ==================== Strategy evaluation ====================
 
 async function hasOpenPosition(broker: DexBroker, tokenAddress: string): Promise<boolean> {
@@ -2051,6 +2129,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   const graduatedTracker = new GraduatedTokensTracker()
   await graduatedTracker.load()
   console.log(`Graduated tracker: ${graduatedTracker.getAll().length} tokens (loaded from active.json)`)
+  console.log(`Post-grad trajectory: logging every tracked graduation for ${POST_GRAD_TRAJECTORY_WINDOW_MS / 3_600_000}h at ${POST_GRAD_TRAJECTORY_INTERVAL_MS / 1000}s cadence (observation only)${heliusKeyPresent ? '' : ' — INERT until HELIUS_API_KEY enables the graduation feed'}`)
   console.log(`GRAD_IMMEDIATE   : ${GRAD_IMMEDIATE_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-02, negative expectancy — see GRAD_IMMEDIATE_ENTRY_SUSPENDED docstring); exits for existing positions still active' : heliusKeyPresent ? `enabled (${GRAD_IMMEDIATE_POST_GRAD_DELAY_MS / 1000}s delay post-graduation)` : 'disabled — needs Graduation feed'}`)
   console.log(`GRAD_DIP         : ${GRAD_DIP_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-03, no positive signal on clean n=33/12 tokens — see GRAD_DIP_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled (25-60% dip from peak)'}`)
   console.log(`EARLY_WEB_FILTERED : ${EARLY_WEB_FILTERED_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-04, reopen bar cleared at n=34 tokens but token-weighted return -3.95pp with a Q3->Q4 sign reversal — see EARLY_WEB_FILTERED_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled, parallel pilot (requireWebsite, EARLY otherwise unchanged) — see EARLY_WEB_FILTERED_CONFIG docstring for the quartile-instability caveat and n≥30+quartile reopen threshold'}`)
@@ -2184,6 +2263,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   let lastHeartbeatAt = 0
   let totalCycleCount = 0
   let lastGradDipCheck = 0
+  let lastPostGradTrajectoryAt = 0
   let stopping = false
   // shutdownController is declared earlier in this function (before
   // heliusPoolFeed's onGraduation callback, which captures it) — aborts
@@ -2236,6 +2316,13 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
       if (!GRAD_DIP_ENTRY_SUSPENDED && Date.now() - lastGradDipCheck >= GRAD_DIP_CHECK_INTERVAL_MS) {
         await handleGradDip(chain, gradDipBroker, graduatedTracker)
         lastGradDipCheck = Date.now()
+      }
+      // Observation only, NOT gated on GRAD_DIP_ENTRY_SUSPENDED — see the
+      // section header above handlePostGradTrajectory for why this owns the
+      // graduated tracker's price refresh now that handleGradDip is gated.
+      if (Date.now() - lastPostGradTrajectoryAt >= POST_GRAD_TRAJECTORY_INTERVAL_MS) {
+        await handlePostGradTrajectory(chain, graduatedTracker)
+        lastPostGradTrajectoryAt = Date.now()
       }
       stats.cycles++
       totalCycleCount++

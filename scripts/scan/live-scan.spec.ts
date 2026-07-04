@@ -94,6 +94,8 @@ import {
   heliusPoolWatchlist,
   handleGradImmediate,
   handleGradDip,
+  handlePostGradTrajectory,
+  postGradTrajectoryLogPath,
   GRAD_IMMEDIATE_EXIT_CONFIG,
   GRAD_DIP_EXIT_CONFIG,
   GRAD_DIP_CONFIG,
@@ -199,6 +201,7 @@ afterEach(async () => {
   await rm(dataPath('silent-distribution'), { recursive: true, force: true })
   await rm(dataPath('position-trajectory'), { recursive: true, force: true })
   await rm(dataPath('vol-liquidity-ratio'), { recursive: true, force: true })
+  await rm(dataPath('post-graduation-trajectory'), { recursive: true, force: true })
   await rm(dataPath('snapshots'), { recursive: true, force: true })
   await rm(dataPath('positions'), { recursive: true, force: true })
   await rm(dataPath('wallets'), { recursive: true, force: true })
@@ -1534,6 +1537,59 @@ describe('handleGradDip', () => {
 describe('GRAD_DIP_ENTRY_SUSPENDED', () => {
   it('is true (2026-07-03, no positive signal on clean n=33/12 independent tokens) — pinned so a silent flip back is caught here rather than discovered live', () => {
     expect(GRAD_DIP_ENTRY_SUSPENDED).toBe(true)
+  })
+})
+
+describe('post-graduation trajectory observability (handlePostGradTrajectory)', () => {
+  async function readPostGradTrajectoryLog(): Promise<Array<Record<string, unknown>>> {
+    try {
+      const raw = await readFile(postGradTrajectoryLogPath(), 'utf-8')
+      return raw.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    } catch {
+      return []
+    }
+  }
+
+  it('logs one tick per tracked graduated token inside the 4h window, and refreshes the tracker price', async () => {
+    const tracker = new GraduatedTokensTracker()
+    await tracker.add({ mintAddress: 'freshGradTok', graduatedAt: Date.now() - 10 * 60_000, signature: 'sig-traj', source: 'helius_logs' }, { symbol: 'FRESH' })
+    pairForMintMock.mockResolvedValue(pair({ address: 'freshGradTok', ageMinutes: 10, priceUsd: '0.5', liquidity: { usd: 40_000 } }))
+
+    const result = await handlePostGradTrajectory('solana', tracker)
+
+    expect(result).toEqual({ tracked: 1, logged: 1 })
+    const entries = await readPostGradTrajectoryLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ mintAddress: 'freshGradTok', symbol: 'FRESH', priceUsd: 0.5, liquidityUsd: 40_000 })
+    expect(entries[0]!.minutesSinceGraduation as number).toBeGreaterThanOrEqual(10)
+    expect(tracker.getAll()[0]!.currentPrice).toBe(0.5)
+  })
+
+  it('does not fetch or log a token graduated more than 4h ago (still tracked until the 6h retention)', async () => {
+    const tracker = new GraduatedTokensTracker()
+    await tracker.add({ mintAddress: 'oldGradTok', graduatedAt: Date.now() - 5 * 60 * 60_000, signature: 'sig-old', source: 'helius_logs' })
+
+    const result = await handlePostGradTrajectory('solana', tracker)
+
+    expect(result).toEqual({ tracked: 0, logged: 0 })
+    expect(pairForMintMock).not.toHaveBeenCalled()
+    expect(await readPostGradTrajectoryLog()).toHaveLength(0)
+    expect(tracker.getAll()).toHaveLength(1) // under 6h — cleanup must not have removed it
+  })
+
+  it('skips (without logging) a token whose pair cannot be resolved, but still logs the others', async () => {
+    const tracker = new GraduatedTokensTracker()
+    await tracker.add({ mintAddress: 'unresolvedTok', graduatedAt: Date.now() - 5 * 60_000, signature: 'sig-a', source: 'helius_logs' })
+    await tracker.add({ mintAddress: 'resolvedTok', graduatedAt: Date.now() - 5 * 60_000, signature: 'sig-b', source: 'helius_logs' })
+    pairForMintMock.mockImplementation(async (mint: string) =>
+      mint === 'resolvedTok' ? pair({ address: 'resolvedTok', ageMinutes: 5, priceUsd: '0.2', liquidity: { usd: 25_000 } }) : null)
+
+    const result = await handlePostGradTrajectory('solana', tracker)
+
+    expect(result).toEqual({ tracked: 2, logged: 1 })
+    const entries = await readPostGradTrajectoryLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ mintAddress: 'resolvedTok' })
   })
 })
 
