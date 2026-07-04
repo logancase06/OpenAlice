@@ -708,6 +708,74 @@ export async function appendSilentDistributionLog(entry: SilentDistributionLogEn
   await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
 }
 
+// ==================== vol/liquidity ratio observability (2026-07-04) ====================
+// Hypothesis explored during a "new strategy ideas" pass (see
+// data/notes/session-summary.md): among candidates EARLY/EARLY_STRICT
+// already buy, does the ratio of h1 volume to current liquidity (a proxy
+// for how hard the pool is being turned over relative to its own size,
+// distinct from either raw liquidity or raw volume alone — neither is
+// currently used as a standalone filter for these two strategies) say
+// anything about outcome? Not a re-test of MOMENTUM_CONFIG's
+// minVolumeLiquidityRatio1h/maxVolumeLiquidityRatio1h (that strategy never
+// fires on the current pump.fun flow, see EARLY_STRICT_CONFIG's docstring,
+// and was never validated against real trades — this is a fresh test).
+//
+// Retroactive test (2026-07-04, n=2002 EARLY/EARLY_STRICT trades with a
+// resolvable pre-entry scan snapshot): splitting by `volumeH1/liquidityUsd`
+// quartile gave Q1 (ratio <= 3.64, n=501, 100 unique tokens) +1.70pp
+// trade-weighted / +2.51pp token-weighted, 0% rug rate — Q2-Q4 (ratio >
+// 3.64) averaged -2.99pp combined. A 2-half chronological walk-forward on
+// the Q1 (low-ratio) group held positive in BOTH halves (+2.61pp / +0.80pp,
+// no sign reversal) and a finer quartile split stayed mostly positive
+// (-1.75pp / +6.98pp / +0.79pp / +0.80pp — Q1 dips slightly negative, the
+// other three hold) — a similar "mostly stable, one soft quartile" shape to
+// hasWebsite's own original retroactive result before it was piloted live
+// and failed (see EARLY_WEB_FILTERED_ENTRY_SUSPENDED's docstring). Given
+// that precedent, this is NOT solid enough to deploy as a filter — a clean
+// retroactive walk-forward on replayed history didn't hold up for
+// hasWebsite either, and this result is honestly weaker (one negative
+// quartile vs zero). Logged for observation only, same discipline.
+//
+// Zero effect on trading decisions — logging only, same convention as
+// silentDistribution/positionTrajectory. Written to its own file (dataPath,
+// the real `~/.openalice/data` root), not data/notes/.
+const LOW_VOL_LIQUIDITY_RATIO_THRESHOLD = 3.64
+
+interface VolLiquidityRatioMatch {
+  volumeH1: number
+  liquidityUsd: number
+  ratio: number
+}
+
+/** Returns the triggering metrics when the ratio is at/below the low-turnover threshold, `null` otherwise (including when volume/liquidity data is missing or liquidity is 0 — no data or a degenerate ratio is never treated as a match). */
+function detectLowVolLiquidityRatio(pair: DexScreenerPair): VolLiquidityRatioMatch | null {
+  const volumeH1 = pair.volume?.h1
+  const liquidityUsd = pair.liquidity?.usd
+  if (volumeH1 == null || liquidityUsd == null || liquidityUsd <= 0) return null
+  const ratio = volumeH1 / liquidityUsd
+  if (ratio > LOW_VOL_LIQUIDITY_RATIO_THRESHOLD) return null
+  return { volumeH1, liquidityUsd, ratio }
+}
+
+interface VolLiquidityRatioLogEntry extends VolLiquidityRatioMatch {
+  timestamp: string
+  tokenAddress: string
+  symbol: string
+  ageMinutes: number
+  /** Which strategies' evaluateStrategy() call passed for this candidate this same cycle — [] means detected but not bought by anything running today. */
+  passedStrategies: StrategyLabel[]
+}
+
+export function volLiquidityRatioLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('vol-liquidity-ratio', `${date}.jsonl`)
+}
+
+export async function appendVolLiquidityRatioLog(entry: VolLiquidityRatioLogEntry): Promise<void> {
+  const filePath = volLiquidityRatioLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
 // ==================== Strategy evaluation ====================
 
 async function hasOpenPosition(broker: DexBroker, tokenAddress: string): Promise<boolean> {
@@ -1217,6 +1285,22 @@ export async function runScanPhase(
         ageMinutes,
         passedStrategies,
         ...silentDistMatch,
+      })
+    }
+
+    // Observability only — see the section header above detectLowVolLiquidityRatio
+    // for the hypothesis, its retroactive test result, and why this logs
+    // every candidate regardless of buy outcome.
+    const volLiqMatch = detectLowVolLiquidityRatio(pair)
+    if (volLiqMatch) {
+      const passedStrategies = (Object.keys(decisions) as StrategyLabel[]).filter(label => decisions[label]?.pass)
+      await appendVolLiquidityRatioLog({
+        timestamp: new Date(now).toISOString(),
+        tokenAddress: profile.tokenAddress,
+        symbol: pair.baseToken.symbol,
+        ageMinutes,
+        passedStrategies,
+        ...volLiqMatch,
       })
     }
 

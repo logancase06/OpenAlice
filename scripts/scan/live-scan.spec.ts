@@ -79,6 +79,7 @@ import {
   EARLY_WEB_FILTERED_ENTRY_SUSPENDED,
   silentDistributionLogPath,
   positionTrajectoryLogPath,
+  volLiquidityRatioLogPath,
   EARLY_EXIT_CONFIG,
   SCALP_EXIT_CONFIG,
   runLiveScan,
@@ -163,6 +164,15 @@ async function readPositionTrajectoryLog(): Promise<Array<Record<string, unknown
   }
 }
 
+async function readVolLiquidityRatioLog(): Promise<Array<Record<string, unknown>>> {
+  try {
+    const raw = await readFile(volLiquidityRatioLogPath(), 'utf-8')
+    return raw.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  } catch {
+    return []
+  }
+}
+
 beforeEach(() => {
   profilesMock.mockReset()
   pairsMock.mockReset()
@@ -188,6 +198,7 @@ afterEach(async () => {
   await rm(dataPath('scan-log'), { recursive: true, force: true })
   await rm(dataPath('silent-distribution'), { recursive: true, force: true })
   await rm(dataPath('position-trajectory'), { recursive: true, force: true })
+  await rm(dataPath('vol-liquidity-ratio'), { recursive: true, force: true })
   await rm(dataPath('snapshots'), { recursive: true, force: true })
   await rm(dataPath('positions'), { recursive: true, force: true })
   await rm(dataPath('wallets'), { recursive: true, force: true })
@@ -1310,6 +1321,78 @@ describe('silent-distribution observability (detectSilentDistributionPattern)', 
     await runScanPhase('solana', [{ config: { ...EARLY_CONFIG, useSolanaRpc: false }, broker }], new RateLimiter(), freshStats())
 
     const entries = await readSilentDistributionLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.passedStrategies).toEqual(['early'])
+  })
+})
+
+describe('vol/liquidity ratio observability (detectLowVolLiquidityRatio)', () => {
+  it('logs a candidate at/below the low-turnover threshold (ratio <= 3.64)', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'lowRatioTok' }])
+    pairsMock.mockResolvedValue([pair({
+      address: 'lowRatioTok', ageMinutes: 60, liquidity: { usd: 20_000 },
+      volume: { h1: 50_000 }, // ratio = 2.5
+    })])
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    const entries = await readVolLiquidityRatioLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ tokenAddress: 'lowRatioTok', volumeH1: 50_000, liquidityUsd: 20_000, ratio: 2.5, passedStrategies: [] })
+  })
+
+  it('does not log a candidate above the threshold (high turnover)', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'highRatioTok' }])
+    pairsMock.mockResolvedValue([pair({
+      address: 'highRatioTok', ageMinutes: 60, liquidity: { usd: 20_000 },
+      volume: { h1: 200_000 }, // ratio = 10
+    })])
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    expect(await readVolLiquidityRatioLog()).toHaveLength(0)
+  })
+
+  it('logs a candidate exactly at the threshold boundary (inclusive)', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'boundaryTok' }])
+    pairsMock.mockResolvedValue([pair({
+      address: 'boundaryTok', ageMinutes: 60, liquidity: { usd: 10_000 },
+      volume: { h1: 36_400 }, // ratio = 3.64 exactly
+    })])
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    expect(await readVolLiquidityRatioLog()).toHaveLength(1)
+  })
+
+  it('does not log when volume.h1 is missing or liquidity is 0 — no data or a degenerate ratio is not a match', async () => {
+    profilesMock.mockResolvedValue([
+      { chainId: 'solana', tokenAddress: 'noVolumeTok' },
+      { chainId: 'solana', tokenAddress: 'zeroLiqTok' },
+    ])
+    pairsMock.mockImplementation(async (_chain, tokenAddress) => {
+      if (tokenAddress === 'noVolumeTok') return [pair({ address: 'noVolumeTok', ageMinutes: 60, liquidity: { usd: 20_000 } })]
+      return [pair({ address: 'zeroLiqTok', ageMinutes: 60, liquidity: { usd: 0 }, volume: { h1: 100 } })]
+    })
+
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    expect(await readVolLiquidityRatioLog()).toHaveLength(0)
+  })
+
+  it('records which strategies passed for a matching candidate this same cycle', async () => {
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'lowRatioBoughtTok' }])
+    const candidate = pair({
+      address: 'lowRatioBoughtTok', ageMinutes: 100, liquidity: { usd: 50_000 },
+      volume: { h1: 50_000 }, // ratio = 1.0
+    })
+    pairsMock.mockResolvedValue([candidate])
+    const broker = new DexBroker({ id: 'low-ratio-bought', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+
+    await runScanPhase('solana', [{ config: { ...EARLY_CONFIG, useSolanaRpc: false }, broker }], new RateLimiter(), freshStats())
+
+    const entries = await readVolLiquidityRatioLog()
     expect(entries).toHaveLength(1)
     expect(entries[0]!.passedStrategies).toEqual(['early'])
   })
