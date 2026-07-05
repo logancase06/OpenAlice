@@ -770,7 +770,7 @@ export async function appendSilentDistributionLog(entry: SilentDistributionLogEn
 // Zero effect on trading decisions — logging only, same convention as
 // silentDistribution/positionTrajectory. Written to its own file (dataPath,
 // the real `~/.openalice/data` root), not data/notes/.
-const LOW_VOL_LIQUIDITY_RATIO_THRESHOLD = 3.64
+export const LOW_VOL_LIQUIDITY_RATIO_THRESHOLD = 3.64
 
 interface VolLiquidityRatioMatch {
   volumeH1: number

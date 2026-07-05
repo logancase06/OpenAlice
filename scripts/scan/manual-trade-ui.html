@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Entraînement manuel — paper trading</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; }
+  header { padding: 10px 16px; background: #161b22; display: flex; gap: 16px; align-items: baseline; position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .sub { color: #8b949e; font-size: 12px; }
+  main { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; padding: 12px; }
+  #cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; align-content: start; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px; cursor: pointer; }
+  .card:hover { border-color: #58a6ff; }
+  .card .top { display: flex; justify-content: space-between; align-items: center; }
+  .card .sym { font-weight: 700; font-size: 15px; }
+  .age { font-size: 14px; font-weight: 800; padding: 2px 8px; border-radius: 10px; }
+  .age.danger { background: #da3633; color: #fff; }
+  .age.warn { background: #bb8009; color: #fff; }
+  .age.ok { background: #238636; color: #fff; }
+  .row { color: #8b949e; font-size: 12px; margin-top: 4px; display: flex; justify-content: space-between; }
+  .badges { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+  .b { font-size: 11px; padding: 1px 6px; border-radius: 8px; border: 1px solid #30363d; color: #8b949e; }
+  .b.good { border-color: #238636; color: #3fb950; }
+  .b.bad { border-color: #da3633; color: #f85149; }
+  .b.info { border-color: #1f6feb; color: #58a6ff; }
+  aside section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px; margin-bottom: 12px; }
+  aside h2 { font-size: 13px; margin: 0 0 8px; color: #8b949e; text-transform: uppercase; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td, th { padding: 3px 4px; text-align: left; border-bottom: 1px solid #21262d; }
+  .pos { color: #3fb950; } .neg { color: #f85149; }
+  #toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: #1f6feb; color: #fff; padding: 8px 14px; border-radius: 8px; display: none; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎯 Entraînement manuel <span class="sub">paper — TP +100% (x2) / SL −20%</span></h1>
+  <span class="sub" id="feedState">connexion…</span>
+</header>
+<main>
+  <div id="cards"></div>
+  <aside>
+    <section>
+      <h2>Positions en cours</h2>
+      <table id="openTable"><tbody></tbody></table>
+    </section>
+    <section>
+      <h2>Mes trades clos</h2>
+      <table id="closedTable"><tbody></tbody></table>
+    </section>
+    <section>
+      <h2>Mes picks vs stratégies auto</h2>
+      <table id="statsTable"><tbody></tbody></table>
+    </section>
+  </aside>
+</main>
+<div id="toast"></div>
+<script>
+const cards = new Map();
+const cardsEl = document.getElementById('cards');
+
+function ageInfo(c) {
+  if (c.createdAt == null) return { txt: '—', cls: 'warn' };
+  const min = (Date.now() - c.createdAt) / 60000;
+  const txt = min < 60 ? min.toFixed(0) + ' min' : (min / 60).toFixed(1) + ' h';
+  return { txt, cls: min < 5 ? 'danger' : min < 30 ? 'warn' : 'ok' };
+}
+function fmtUsd(v) { return v == null ? '—' : '$' + (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0)); }
+function fmtPrice(v) { return v == null ? '—' : '$' + Number(v).toPrecision(3); }
+
+function renderCard(c) {
+  let el = document.getElementById('card-' + c.mint);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'card';
+    el.id = 'card-' + c.mint;
+    el.onclick = () => buy(c.mint);
+    cardsEl.prepend(el);
+  }
+  const a = ageInfo(c);
+  const badges = [];
+  if (c.earlyStrict) badges.push('<span class="b ' + (c.earlyStrict.pass ? 'good">EARLY_STRICT ✓' : 'bad">EARLY_STRICT ✗') + '</span>');
+  if (c.sdFlagged) badges.push('<span class="b bad">🚩 silent-dist</span>');
+  if (c.volLiqRatio != null) badges.push('<span class="b ' + (c.volLiqLow ? 'good' : 'info') + '">vol/liq ' + c.volLiqRatio.toFixed(1) + '</span>');
+  if (c.hasWebsite) badges.push('<span class="b info">🌐 site</span>');
+  if (c.hasSocials) badges.push('<span class="b info">💬 socials</span>');
+  if (!c.earlyStrict && c.priceUsd == null) badges.push('<span class="b">en attente d\'enrichissement…</span>');
+  el.innerHTML =
+    '<div class="top"><span class="sym">' + escapeHtml(c.symbol) + '</span><span class="age ' + a.cls + '">' + a.txt + '</span></div>' +
+    '<div class="row"><span>' + fmtPrice(c.priceUsd) + '</span><span>liq ' + fmtUsd(c.liquidityUsd) + '</span><span class="' + ((c.priceChangeM5 ?? 0) >= 0 ? 'pos' : 'neg') + '">m5 ' + (c.priceChangeM5 != null ? c.priceChangeM5.toFixed(1) + '%' : '—') + '</span></div>' +
+    '<div class="badges">' + badges.join('') + '</div>';
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
+
+function upsert(c) {
+  const known = cards.get(c.mint);
+  cards.set(c.mint, c);
+  renderCard(c);
+  if (!known) trimCards();
+}
+function trimCards() {
+  while (cardsEl.children.length > 200) cardsEl.removeChild(cardsEl.lastChild);
+}
+setInterval(() => { for (const c of cards.values()) { const el = document.getElementById('card-' + c.mint); if (el) { const a = ageInfo(c); const ageEl = el.querySelector('.age'); ageEl.textContent = a.txt; ageEl.className = 'age ' + a.cls; } } }, 1000);
+
+function toast(msg, ms = 4000) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = 'none'; }, ms);
+}
+
+async function buy(mint) {
+  const c = cards.get(mint);
+  if (!confirm('Ouvrir une position paper $50 sur ' + (c ? c.symbol : mint) + ' ? (TP +100% / SL −20%)')) return;
+  const r = await fetch('/api/buy', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mint }) });
+  const j = await r.json();
+  if (j.ok) toast('✅ ' + j.symbol + ' ouvert @ ' + fmtPrice(j.entryPrice) + ' — clic→position : ' + j.latencyMs + ' ms (' + j.priceSource + ')', 6000);
+  else toast('❌ ' + (j.error || 'échec'), 6000);
+  refreshPositions();
+}
+
+const es = new EventSource('/api/stream');
+es.addEventListener('hello', () => { document.getElementById('feedState').textContent = 'flux temps réel connecté (SSE)'; });
+es.addEventListener('card', e => upsert(JSON.parse(e.data)));
+es.addEventListener('closed', e => {
+  const c = JSON.parse(e.data);
+  toast((c.exitReason === 'take_profit' ? '🎯' : '🛑') + ' CLÔTURE ' + c.symbol + ' : ' + c.exitReason + ' ' + c.returnPct.toFixed(1) + '% après ' + c.holdingMinutes.toFixed(0) + ' min', 8000);
+  refreshPositions();
+});
+es.onerror = () => { document.getElementById('feedState').textContent = 'flux déconnecté — reconnexion…'; };
+
+async function loadInitialFeed() {
+  const j = await (await fetch('/api/feed')).json();
+  for (const c of j.cards.slice().reverse()) upsert(c);
+}
+async function refreshPositions() {
+  const j = await (await fetch('/api/positions')).json();
+  document.querySelector('#openTable tbody').innerHTML = j.positions.length
+    ? j.positions.map(p => '<tr><td>' + escapeHtml(p.symbol) + '</td><td>' + fmtPrice(p.entryPrice) + '→' + fmtPrice(p.currentPrice) + '</td><td class="' + ((p.returnPct ?? 0) >= 0 ? 'pos' : 'neg') + '">' + (p.returnPct != null ? p.returnPct.toFixed(1) + '%' : '—') + '</td><td>' + p.holdingMinutes.toFixed(0) + 'min</td></tr>').join('')
+    : '<tr><td>aucune</td></tr>';
+  document.querySelector('#closedTable tbody').innerHTML = j.closed.length
+    ? j.closed.slice(0, 15).map(c => '<tr><td>' + escapeHtml(c.symbol) + '</td><td>' + c.exitReason + '</td><td class="' + (c.returnPct >= 0 ? 'pos' : 'neg') + '">' + c.returnPct.toFixed(1) + '%</td></tr>').join('')
+    : '<tr><td>aucun</td></tr>';
+  document.querySelector('#statsTable tbody').innerHTML =
+    '<tr><th>stratégie</th><th>n</th><th>win</th><th>moy</th></tr>' +
+    j.stats.map(s => '<tr' + (s.label === 'MES PICKS' ? ' style="font-weight:700"' : '') + '><td>' + escapeHtml(s.label) + '</td><td>' + s.n + '</td><td>' + s.winRatePct.toFixed(0) + '%</td><td class="' + (s.avgReturnPct >= 0 ? 'pos' : 'neg') + '">' + s.avgReturnPct.toFixed(2) + '%</td></tr>').join('');
+}
+loadInitialFeed();
+refreshPositions();
+setInterval(refreshPositions, 5000);
+</script>
+</body>
+</html>
