@@ -34,8 +34,8 @@
  * result, never a thrown error), but it's the first thing to revisit if a
  * live run shows this dominating cycle time.
  */
-import { appendFile, mkdir, writeFile, rename } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { appendFile, mkdir, writeFile, rename, readFile, readdir } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import Decimal from 'decimal.js'
 import { Order } from '@traderalice/ibkr'
 import { dataPath } from '@/core/paths.js'
@@ -854,6 +854,94 @@ export async function handlePostGradTrajectory(
   return { tracked: withinWindow.length, logged }
 }
 
+// ==================== SD-avoidance shadow pilot (2026-07-05) ====================
+// Shadow pilot for a silent-distribution AVOIDANCE guard — logs "this entry
+// would have been skipped" WITHOUT skipping it. Zero trading-behavior change.
+//
+// Retrospective basis (2026-07-05, the first signal this session to clear
+// BOTH bars): trades entered on tokens already flagged by silent-distribution
+// averaged -6.67%/trade / -12.15%/token (n=137 trades / 21 unique tokens) vs
+// -1.45%/-3.15% for unflagged (n=1834/190). Quartile walk-forward of the gap:
+// -4.64/-5.43/-6.07/-4.85pp — negative in all four, no inversion. Not a
+// concentration artifact: 17/21 flagged tokens negative, spread contributions
+// (worst single token -198pp out of -914pp total avoided).
+//
+// LIMIT, stated up front: skipping those 137 trades improves the whole
+// population's average by only +0.36pp/trade (-1.45% vs -1.81%) — this is a
+// HYGIENE guard, not a solution to the structural profitability gap
+// documented in this session's conclusion (session-summary.md, top section).
+//
+// VALIDATION BAR — fixed NOW, before activation, not a posteriori (the
+// EARLY_WEB_FILTERED lesson: a clean retrospective already failed twice to
+// replicate prospectively). The shadow pilot graduates to a real skip-guard
+// only if, on tokens first flagged AFTER this pilot's activation:
+//   1. n >= 20 unique flagged-then-entered tokens (tokens, not trades),
+//   2. the return gap (would-have-skipped vs rest) is still negative,
+//   3. quartile walk-forward of that gap shows no inversion.
+// Anything short of all three keeps it in shadow (or kills it).
+export const SD_AVOIDANCE_SHADOW_VALIDATION_BAR = {
+  minUniqueFlaggedTokensLive: 20,
+  gapRequirement: 'negative',
+  walkForward: 'quartiles without inversion',
+} as const
+
+/**
+ * mint -> first-flag timestamp (ms). Seeded from the on-disk
+ * silent-distribution logs at startup, then updated live as new detections
+ * are appended in runScanPhase. Entries only ever contain PAST detections,
+ * so membership at buy time is exactly "flagged before this entry" — the
+ * same framing the retrospective validated. (Same-cycle flag+buy resolves
+ * as NOT flagged: the map is updated after the cycle's buy decisions, which
+ * mirrors reality — the flag wasn't knowable before the buy.)
+ */
+export const sdFlaggedTokens = new Map<string, number>()
+
+/** Reads every data/silent-distribution/*.jsonl into sdFlaggedTokens — call once at startup, same convention as GraduatedTokensTracker.load(). Missing dir/corrupt lines start empty/skip rather than throw. */
+export async function loadSilentDistributionFlags(): Promise<void> {
+  let files: string[]
+  const dir = dataPath('silent-distribution')
+  try {
+    files = (await readdir(dir)).filter(f => f.endsWith('.jsonl'))
+  } catch {
+    return
+  }
+  for (const f of files) {
+    let raw: string
+    try { raw = await readFile(join(dir, f), 'utf-8') } catch { continue }
+    for (const line of raw.split('\n').filter(Boolean)) {
+      try {
+        const e = JSON.parse(line) as { tokenAddress?: string; timestamp?: string }
+        if (!e.tokenAddress || !e.timestamp) continue
+        const ts = new Date(e.timestamp).getTime()
+        const prev = sdFlaggedTokens.get(e.tokenAddress)
+        if (prev == null || ts < prev) sdFlaggedTokens.set(e.tokenAddress, ts)
+      } catch { /* corrupt line — skip */ }
+    }
+  }
+}
+
+interface SdAvoidanceShadowLogEntry {
+  timestamp: string
+  tokenAddress: string
+  symbol: string
+  strategy: StrategyLabel
+  entryPrice: number
+  /** ISO of the token's FIRST silent-distribution detection — validation filters on this being after pilot activation to count only flagged-live tokens. */
+  firstFlaggedAt: string
+  /** How long before this entry the token was first flagged. */
+  flagLeadMinutes: number
+}
+
+export function sdAvoidanceShadowLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('sd-avoidance-shadow', `${date}.jsonl`)
+}
+
+export async function appendSdAvoidanceShadowLog(entry: SdAvoidanceShadowLogEntry): Promise<void> {
+  const filePath = sdAvoidanceShadowLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
 // ==================== Strategy evaluation ====================
 
 async function hasOpenPosition(broker: DexBroker, tokenAddress: string): Promise<boolean> {
@@ -907,6 +995,22 @@ export async function evaluateStrategy(
       const fastExitRegime = isFastExitRegimeStrategy(cfg.label) ? true : undefined
       await openPosition(pair, cfg.label, entryPrice, ageMinutes, cfg.exitConfig, buyerWallets, fastExitRegime)
       priceFeed.subscribe(pair.pairAddress)
+      // SD-avoidance shadow pilot — observation only, the buy above already
+      // happened and stays. See the section header above sdFlaggedTokens.
+      const firstFlaggedAt = sdFlaggedTokens.get(tokenAddress)
+      if (firstFlaggedAt != null) {
+        const now = Date.now()
+        await appendSdAvoidanceShadowLog({
+          timestamp: new Date(now).toISOString(),
+          tokenAddress,
+          symbol: pair.baseToken.symbol,
+          strategy: cfg.label,
+          entryPrice,
+          firstFlaggedAt: new Date(firstFlaggedAt).toISOString(),
+          flagLeadMinutes: (now - firstFlaggedAt) / 60_000,
+        })
+        console.log(`SD-avoidance shadow: would have SKIPPED ${pair.baseToken.symbol} (${cfg.label}) — flagged ${((now - firstFlaggedAt) / 60_000).toFixed(0)}min before entry`)
+      }
     } else {
       console.warn(`live-scan: buy filled for ${tokenAddress} but pair.priceUsd was unusable — position not recorded in position-tracker`)
     }
@@ -1364,6 +1468,10 @@ export async function runScanPhase(
         passedStrategies,
         ...silentDistMatch,
       })
+      // Feed the SD-avoidance shadow registry — deliberately AFTER this
+      // cycle's buy decisions (see sdFlaggedTokens's docstring for why a
+      // same-cycle flag must not count as "flagged before entry").
+      if (!sdFlaggedTokens.has(profile.tokenAddress)) sdFlaggedTokens.set(profile.tokenAddress, now)
     }
 
     // Observability only — see the section header above detectLowVolLiquidityRatio
@@ -2130,6 +2238,8 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   await graduatedTracker.load()
   console.log(`Graduated tracker: ${graduatedTracker.getAll().length} tokens (loaded from active.json)`)
   console.log(`Post-grad trajectory: logging every tracked graduation for ${POST_GRAD_TRAJECTORY_WINDOW_MS / 3_600_000}h at ${POST_GRAD_TRAJECTORY_INTERVAL_MS / 1000}s cadence (observation only)${heliusKeyPresent ? '' : ' — INERT until HELIUS_API_KEY enables the graduation feed'}`)
+  await loadSilentDistributionFlags()
+  console.log(`SD-avoidance shadow pilot: ${sdFlaggedTokens.size} flagged tokens preloaded — logs would-be skips only, never skips (validation bar: n>=${SD_AVOIDANCE_SHADOW_VALIDATION_BAR.minUniqueFlaggedTokensLive} flagged-live tokens, negative gap, quartiles without inversion)`)
   console.log(`GRAD_IMMEDIATE   : ${GRAD_IMMEDIATE_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-02, negative expectancy — see GRAD_IMMEDIATE_ENTRY_SUSPENDED docstring); exits for existing positions still active' : heliusKeyPresent ? `enabled (${GRAD_IMMEDIATE_POST_GRAD_DELAY_MS / 1000}s delay post-graduation)` : 'disabled — needs Graduation feed'}`)
   console.log(`GRAD_DIP         : ${GRAD_DIP_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-03, no positive signal on clean n=33/12 tokens — see GRAD_DIP_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled (25-60% dip from peak)'}`)
   console.log(`EARLY_WEB_FILTERED : ${EARLY_WEB_FILTERED_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-04, reopen bar cleared at n=34 tokens but token-weighted return -3.95pp with a Q3->Q4 sign reversal — see EARLY_WEB_FILTERED_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled, parallel pilot (requireWebsite, EARLY otherwise unchanged) — see EARLY_WEB_FILTERED_CONFIG docstring for the quartile-instability caveat and n≥30+quartile reopen threshold'}`)

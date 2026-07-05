@@ -96,6 +96,11 @@ import {
   handleGradDip,
   handlePostGradTrajectory,
   postGradTrajectoryLogPath,
+  sdFlaggedTokens,
+  loadSilentDistributionFlags,
+  sdAvoidanceShadowLogPath,
+  appendSilentDistributionLog,
+  SD_AVOIDANCE_SHADOW_VALIDATION_BAR,
   GRAD_IMMEDIATE_EXIT_CONFIG,
   GRAD_DIP_EXIT_CONFIG,
   GRAD_DIP_CONFIG,
@@ -202,6 +207,8 @@ afterEach(async () => {
   await rm(dataPath('position-trajectory'), { recursive: true, force: true })
   await rm(dataPath('vol-liquidity-ratio'), { recursive: true, force: true })
   await rm(dataPath('post-graduation-trajectory'), { recursive: true, force: true })
+  await rm(dataPath('sd-avoidance-shadow'), { recursive: true, force: true })
+  sdFlaggedTokens.clear()
   await rm(dataPath('snapshots'), { recursive: true, force: true })
   await rm(dataPath('positions'), { recursive: true, force: true })
   await rm(dataPath('wallets'), { recursive: true, force: true })
@@ -1537,6 +1544,60 @@ describe('handleGradDip', () => {
 describe('GRAD_DIP_ENTRY_SUSPENDED', () => {
   it('is true (2026-07-03, no positive signal on clean n=33/12 independent tokens) — pinned so a silent flip back is caught here rather than discovered live', () => {
     expect(GRAD_DIP_ENTRY_SUSPENDED).toBe(true)
+  })
+})
+
+describe('SD-avoidance shadow pilot', () => {
+  async function readShadowLog(): Promise<Array<Record<string, unknown>>> {
+    try {
+      const raw = await readFile(sdAvoidanceShadowLogPath(), 'utf-8')
+      return raw.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    } catch {
+      return []
+    }
+  }
+
+  it('pins the validation bar fixed before activation (2026-07-05) — a silent loosening is caught here', () => {
+    expect(SD_AVOIDANCE_SHADOW_VALIDATION_BAR).toEqual({
+      minUniqueFlaggedTokensLive: 20,
+      gapRequirement: 'negative',
+      walkForward: 'quartiles without inversion',
+    })
+  })
+
+  it('a successful buy on a previously-flagged token logs a would-be skip AND still opens the position', async () => {
+    sdFlaggedTokens.set('flaggedTok', Date.now() - 45 * 60_000)
+    pairsMock.mockResolvedValue([pair({ address: 'flaggedTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 } })])
+    const broker = new DexBroker({ id: 'sd-shadow-buy', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+
+    const decision = await evaluateStrategy({ ...EARLY_CONFIG, useSolanaRpc: false }, 'solana', 'flaggedTok', 100, broker, pair({ address: 'flaggedTok', ageMinutes: 100 }))
+
+    expect(decision.tradeSimulated).toBe(true) // behavior unchanged — the buy happened
+    const entries = await readShadowLog()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ tokenAddress: 'flaggedTok', strategy: 'early' })
+    expect(entries[0]!.flagLeadMinutes as number).toBeGreaterThanOrEqual(45)
+  })
+
+  it('a successful buy on an unflagged token logs nothing', async () => {
+    pairsMock.mockResolvedValue([pair({ address: 'cleanTok', ageMinutes: 100, priceUsd: '0.05', liquidity: { usd: 50_000 } })])
+    const broker = new DexBroker({ id: 'sd-shadow-clean', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+
+    const decision = await evaluateStrategy({ ...EARLY_CONFIG, useSolanaRpc: false }, 'solana', 'cleanTok', 100, broker, pair({ address: 'cleanTok', ageMinutes: 100 }))
+
+    expect(decision.tradeSimulated).toBe(true)
+    expect(await readShadowLog()).toHaveLength(0)
+  })
+
+  it('loadSilentDistributionFlags seeds the registry from the on-disk silent-distribution logs, keeping the EARLIEST flag per token', async () => {
+    await appendSilentDistributionLog({ timestamp: '2026-07-04T10:00:00.000Z', tokenAddress: 'diskTok', symbol: 'DISK', liquidityUsd: 20_000, ageMinutes: 60, passedStrategies: [], buysH1: 4000, priceChangeH1: -10 })
+    await appendSilentDistributionLog({ timestamp: '2026-07-04T12:00:00.000Z', tokenAddress: 'diskTok', symbol: 'DISK', liquidityUsd: 20_000, ageMinutes: 180, passedStrategies: [], buysH1: 3000, priceChangeH1: -5 })
+
+    await loadSilentDistributionFlags()
+
+    expect(sdFlaggedTokens.get('diskTok')).toBe(new Date('2026-07-04T10:00:00.000Z').getTime())
   })
 })
 
