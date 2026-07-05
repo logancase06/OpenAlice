@@ -117,6 +117,37 @@ export const SCALP_EXIT_CONFIG: PositionExitConfig = {
   timeExitMinutes: 90,
 }
 
+// Manual training mode (2026-07-05) — exit rules for user-picked paper
+// positions opened via scripts/scan/manual-trade.ts. Deliberately raw
+// x2-or-stop: take_profit +100%, stop_loss -20%, and every other rule
+// disabled via JSON-safe finite sentinels (Infinity would serialize to null
+// in open.json and break restore) — the user asked to see the unfiltered
+// behavior of their own picks under a bare 2:1-style bracket, with no
+// momentum_reversal/time_exit/trailing interference.
+export const MANUAL_EXIT_CONFIG: PositionExitConfig = {
+  stopLoss: -20,
+  takeProfit: 100,
+  trailingStopActivationPct: 1_000_000, // never arms
+  trailingStopPct: -100,
+  momentumThreshold: -1_000_000, // m5 can never reach this — rule never fires
+  timeExitMinutes: 527_040, // ~1 year — effectively no time exit
+}
+
+// Not part of the scanner's strategy set — never passed to runScanPhase or
+// the scanner's exit timers. Owned entirely by the manual-trade CLI (its own
+// broker id, its own 5s watch loop), so manual positions cannot count toward
+// any automatic strategy's MAX_OPEN_POSITIONS_PER_STRATEGY (that cap is
+// per-broker, and this label gets its own broker).
+export const MANUAL_CONFIG: StrategyConfig = {
+  label: 'manual',
+  minAgeMinutes: 0,
+  minLiquidityUsd: 0,
+  requireGoPlus: false,
+  useSolanaRpc: false,
+  useLiquidityTracker: false,
+  exitConfig: MANUAL_EXIT_CONFIG,
+}
+
 export const CONSERVATIVE_CONFIG: StrategyConfig = {
   label: 'conservative',
   minAgeMinutes: 360,
@@ -493,7 +524,7 @@ const MAX_OPEN_POSITIONS_PER_STRATEGY = 5
 // infer a restored position's quantity (quantity = TRADE_AMOUNT_USD / entryPrice)
 // since position-tracker.ts's OpenPosition doesn't persist quantity/amountUsd —
 // valid only as long as every buy uses this same fixed amount.
-const TRADE_AMOUNT_USD = 50
+export const TRADE_AMOUNT_USD = 50
 
 // ==================== Rate limiting ====================
 
@@ -1820,7 +1851,11 @@ const FAST_EXIT_CHECK_INTERVAL_MS = 5_000
  * crash-speed risk applies regardless of its entry filter, see
  * EARLY_WEB_FILTERED_CONFIG's docstring.
  */
-const FAST_EXIT_REGIME_LABELS: ReadonlySet<StrategyLabel> = new Set(['early', 'early_strict', 'early_web_filtered', 'grad_immediate'])
+// 'manual' included 2026-07-05: manual training positions are monitored by
+// the manual-trade CLI's own 5s loop (never by the scanner — see
+// scripts/scan/manual-trade.ts's header), and inclusion here gives them the
+// same position-trajectory tick logging as the other fast-regime strategies.
+const FAST_EXIT_REGIME_LABELS: ReadonlySet<StrategyLabel> = new Set(['early', 'early_strict', 'early_web_filtered', 'grad_immediate', 'manual'])
 
 function isFastExitRegimeStrategy(label: StrategyLabel): boolean {
   return FAST_EXIT_REGIME_LABELS.has(label)

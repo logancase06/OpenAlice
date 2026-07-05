@@ -101,6 +101,8 @@ import {
   sdAvoidanceShadowLogPath,
   appendSilentDistributionLog,
   SD_AVOIDANCE_SHADOW_VALIDATION_BAR,
+  MANUAL_CONFIG,
+  MANUAL_EXIT_CONFIG,
   GRAD_IMMEDIATE_EXIT_CONFIG,
   GRAD_DIP_EXIT_CONFIG,
   GRAD_DIP_CONFIG,
@@ -1544,6 +1546,44 @@ describe('handleGradDip', () => {
 describe('GRAD_DIP_ENTRY_SUSPENDED', () => {
   it('is true (2026-07-03, no positive signal on clean n=33/12 independent tokens) — pinned so a silent flip back is caught here rather than discovered live', () => {
     expect(GRAD_DIP_ENTRY_SUSPENDED).toBe(true)
+  })
+})
+
+describe('manual training mode (MANUAL_CONFIG / MANUAL_EXIT_CONFIG)', () => {
+  it('pins the requested bracket: take_profit +100 (x2), stop_loss -20, everything else disabled via JSON-safe sentinels', () => {
+    expect(MANUAL_EXIT_CONFIG.takeProfit).toBe(100)
+    expect(MANUAL_EXIT_CONFIG.stopLoss).toBe(-20)
+    // Finite sentinels, not Infinity — Infinity serializes to null in open.json and would break restore.
+    expect(Number.isFinite(MANUAL_EXIT_CONFIG.trailingStopActivationPct)).toBe(true)
+    expect(Number.isFinite(MANUAL_EXIT_CONFIG.momentumThreshold)).toBe(true)
+    expect(Number.isFinite(MANUAL_EXIT_CONFIG.timeExitMinutes)).toBe(true)
+    expect(MANUAL_CONFIG.label).toBe('manual')
+  })
+
+  function manualPosition(overrides: Partial<OpenPosition> = {}): OpenPosition {
+    return buildOpenPosition({ strategy: 'manual', exitConfig: MANUAL_EXIT_CONFIG, ...overrides })
+  }
+
+  it('take_profit fires at exactly +100%', () => {
+    expect(evaluateExitRules(manualPosition({ entryPrice: 1.0, peakPrice: 1.0 }), 2.0, 10_000, undefined)).toBe('take_profit')
+    expect(evaluateExitRules(manualPosition({ entryPrice: 1.0, peakPrice: 1.0 }), 1.99, 10_000, undefined)).toBeNull()
+  })
+
+  it('stop_loss fires at -20% (checked just past the boundary — float precision keeps exactly 0.80 at -19.999…%)', () => {
+    expect(evaluateExitRules(manualPosition({ entryPrice: 1.0, peakPrice: 1.0 }), 0.799, 10_000, undefined)).toBe('stop_loss')
+    expect(evaluateExitRules(manualPosition({ entryPrice: 1.0, peakPrice: 1.0 }), 0.81, 10_000, undefined)).toBeNull()
+  })
+
+  it('momentum_reversal and trailing_stop never fire, even on inputs that would trigger them for EARLY', () => {
+    // m5 crashing and accelerating (would fire momentum_reversal under EARLY's -10 threshold)
+    const pos = manualPosition({ entryPrice: 1.0, peakPrice: 1.9, lastPriceChange5m: -5 })
+    // peak +90% with a -15.8% drop from peak (would fire trailing_stop under EARLY's config)
+    expect(evaluateExitRules(pos, 1.6, 10_000, -40)).toBeNull()
+  })
+
+  it('time_exit never fires within any realistic holding window', () => {
+    const pos = manualPosition({ entryPrice: 1.0, peakPrice: 1.0, entryTimestamp: Date.now() - 7 * 24 * 60 * 60_000 }) // held 1 week
+    expect(evaluateExitRules(pos, 1.0, 10_000, undefined)).toBeNull()
   })
 })
 

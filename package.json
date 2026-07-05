@@ -24,6 +24,7 @@
     "retro:exitsim": "node --conditions=openalice-source --import tsx/esm scripts/retro/exit-sim.ts",
     "retro:full": "node --conditions=openalice-source --import tsx/esm scripts/retro/full-retro.ts",
     "scan:live": "node --conditions=openalice-source --import tsx/esm scripts/scan/live-scan.ts",
+    "manual-trade": "node --conditions=openalice-source --import tsx/esm scripts/scan/manual-trade.ts",
     "wallets:bootstrap": "node --conditions=openalice-source --import tsx/esm services/uta/src/domain/trading/brokers/dex/wallet-bootstrapper.ts",
     "postinstall": "node scripts/fix-pty-perms.mjs"
   },
