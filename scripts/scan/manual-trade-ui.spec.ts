@@ -3,10 +3,12 @@ import {
   CARD_CAP,
   upsertFastFeedCard,
   enrichCardFromScan,
+  applyPriceTick,
   listCards,
   type TokenCard,
   type ScanFeedEntry,
 } from './manual-trade-ui.js'
+import type { PriceUpdate } from '../../services/uta/src/domain/trading/brokers/dex/dex-price-feed.js'
 import { buildStatsRows } from './manual-trade-core.js'
 import type { ClosedPosition } from '../../services/uta/src/domain/trading/brokers/dex/position-tracker.js'
 
@@ -31,9 +33,9 @@ function scanEntry(overrides: Partial<ScanFeedEntry> = {}): ScanFeedEntry {
 describe('manual-trade-ui card store', () => {
   it('a fast-feed event creates a card immediately with partial data (no blocking enrichment)', () => {
     const store = new Map<string, TokenCard>()
-    const card = upsertFastFeedCard(store, 'pump', { mintAddress: 'mintFresh', symbol: 'FRSH', name: 'Fresh', createdAt: NOW - 4_000 }, NOW)
+    const card = upsertFastFeedCard(store, 'pump', { mintAddress: 'mintFresh', symbol: 'FRSH', name: 'Fresh', createdAt: NOW - 4_000, pool: 'pump', isMayhemMode: true }, NOW)
 
-    expect(card).toMatchObject({ mint: 'mintFresh', symbol: 'FRSH', source: 'pump', createdAt: NOW - 4_000, sdFlagged: false })
+    expect(card).toMatchObject({ mint: 'mintFresh', symbol: 'FRSH', source: 'pump', createdAt: NOW - 4_000, sdFlagged: false, pool: 'pump', isMayhemMode: true })
     expect(card.priceUsd).toBeUndefined() // partial — enrichment comes later
     expect(listCards(store)).toHaveLength(1)
   })
@@ -69,6 +71,25 @@ describe('manual-trade-ui card store', () => {
     expect(card.sdFlagged).toBe(true)
     expect(card.volLiqRatio).toBeCloseTo(10) // 200k / 20k
     expect(card.volLiqLow).toBe(false)
+  })
+
+  it('applies fresh price ticks, ignores stale/duplicate ones, and keeps scan entries from overwriting a fresher tick', () => {
+    const store = new Map<string, TokenCard>()
+    const card = enrichCardFromScan(store, scanEntry(), NO_SD, NOW)
+    const tick = (over: Partial<PriceUpdate> = {}): PriceUpdate =>
+      ({ pairAddress: 'pair-mintA', priceUsd: 0.002, priceChange: { m5: 7 }, liquidityUsd: 25_000, timestamp: NOW + 3_000, ...over })
+
+    expect(applyPriceTick(card, tick(), NOW + 3_000)).toBe(true)
+    expect(card).toMatchObject({ priceUsd: 0.002, liquidityUsd: 25_000, priceChangeM5: 7 })
+    expect(card.volLiqRatio).toBeCloseTo(2) // 50k volume from scan / 25k fresh liquidity
+
+    expect(applyPriceTick(card, tick(), NOW + 6_000)).toBe(false) // same tick timestamp — no re-broadcast
+    expect(applyPriceTick(card, tick({ timestamp: NOW + 6_000 }), NOW + 60_000)).toBe(false) // older than freshMs
+    expect(applyPriceTick(card, tick({ priceUsd: 0, timestamp: NOW + 6_000 }), NOW + 6_000)).toBe(false) // no valid price
+
+    // A scan entry older than the applied tick must not roll the price back.
+    enrichCardFromScan(store, scanEntry({ timestamp: new Date(NOW).toISOString() }), NO_SD, NOW + 6_000)
+    expect(card.priceUsd).toBe(0.002)
   })
 
   it('lists newest-first and evicts the oldest card past CARD_CAP', () => {

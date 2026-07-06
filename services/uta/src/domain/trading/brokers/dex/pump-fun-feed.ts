@@ -45,6 +45,10 @@ export interface PumpFunToken {
   initialLiquidityUsd?: number
   creatorAddress?: string
   metadataUri?: string
+  /** Launchpad the relay tagged the token with (e.g. 'pump', 'bonk') — pass-through of pumpportal's `pool` field, absent on older/unknown message shapes. */
+  pool?: string
+  /** Pump.fun "Mayhem mode" launch — pass-through of pumpportal's `is_mayhem_mode` field (confirmed live 2026-07-05), undefined when the relay omits it. */
+  isMayhemMode?: boolean
 }
 
 export interface PumpFunFeedConfig {
@@ -62,6 +66,8 @@ interface RawPumpPortalMessage {
   uri?: string
   txType?: string
   vSolInBondingCurve?: number
+  pool?: string
+  is_mayhem_mode?: boolean
 }
 
 let cachedSolPrice: { price: number; expiresAt: number } | null = null
@@ -207,6 +213,8 @@ export class PumpFunFeed {
       initialLiquidityUsd,
       creatorAddress: parsed.traderPublicKey,
       metadataUri: parsed.uri,
+      pool: typeof parsed.pool === 'string' ? parsed.pool : undefined,
+      isMayhemMode: typeof parsed.is_mayhem_mode === 'boolean' ? parsed.is_mayhem_mode : undefined,
     }
 
     try {

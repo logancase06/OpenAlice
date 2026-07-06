@@ -54,7 +54,7 @@ import {
 } from './manual-trade-core.js'
 import { PumpFunFeed, type PumpFunToken } from '../../services/uta/src/domain/trading/brokers/dex/pump-fun-feed.js'
 import { HeliusPoolFeed } from '../../services/uta/src/domain/trading/brokers/dex/helius-pool-feed.js'
-import { priceFeed } from '../../services/uta/src/domain/trading/brokers/dex/dex-price-feed.js'
+import { priceFeed, type PriceUpdate } from '../../services/uta/src/domain/trading/brokers/dex/dex-price-feed.js'
 import { openPosition, getClosedToday } from '../../services/uta/src/domain/trading/brokers/dex/position-tracker.js'
 import { MANUAL_CONFIG, TRADE_AMOUNT_USD } from './live-scan.js'
 import { DexBroker } from '../../services/uta/src/domain/trading/brokers/dex/DexBroker.js'
@@ -80,6 +80,10 @@ export interface TokenCard {
   createdAt: number | null
   firstSeenAt: number
   source: 'helius' | 'pump' | 'scan'
+  /** Launchpad tag from the pumpportal relay ('pump', 'bonk', …) — undefined for helius/scan-discovered cards. */
+  pool?: string
+  /** Pump.fun Mayhem-mode launch flag from the relay — undefined for helius/scan-discovered cards. */
+  isMayhemMode?: boolean
   updatedAt: number
   pairAddress?: string
   priceUsd?: number
@@ -93,6 +97,8 @@ export interface TokenCard {
   volLiqLow?: boolean
   hasWebsite?: boolean
   hasSocials?: boolean
+  /** Timestamp of the freshest dex-price-feed tick applied — guards against stale scan entries overwriting a live price. */
+  priceTickAt?: number
 }
 
 /** Minimal shape of a scan-log 'scan' entry that the card store needs — kept structural so tests don't have to build full ScanLogEntry objects. */
@@ -123,14 +129,16 @@ function evictIfOverCap(store: Map<string, TokenCard>): void {
 export function upsertFastFeedCard(
   store: Map<string, TokenCard>,
   source: 'helius' | 'pump',
-  t: { mintAddress: string; symbol?: string; name?: string; createdAt?: number },
+  t: { mintAddress: string; symbol?: string; name?: string; createdAt?: number; pool?: string; isMayhemMode?: boolean },
   now: number,
 ): TokenCard {
   const existing = store.get(t.mintAddress)
   if (existing) {
-    // A fast feed never downgrades scan enrichment — it can only fill createdAt/name gaps.
+    // A fast feed never downgrades scan enrichment — it can only fill createdAt/name/pool gaps.
     if (existing.createdAt == null && t.createdAt != null) existing.createdAt = t.createdAt
     if (!existing.name && t.name) existing.name = t.name
+    if (!existing.pool && t.pool) existing.pool = t.pool
+    if (existing.isMayhemMode == null && t.isMayhemMode != null) existing.isMayhemMode = t.isMayhemMode
     existing.updatedAt = now
     return existing
   }
@@ -141,6 +149,8 @@ export function upsertFastFeedCard(
     createdAt: t.createdAt ?? now,
     firstSeenAt: now,
     source,
+    pool: t.pool,
+    isMayhemMode: t.isMayhemMode,
     updatedAt: now,
     sdFlagged: false,
   }
@@ -173,7 +183,8 @@ export function enrichCardFromScan(
   card.symbol = entry.symbol || card.symbol
   if (card.createdAt == null && Number.isFinite(scanTs)) card.createdAt = scanTs - entry.ageMinutes * 60_000
   if (entry.pairAddress) card.pairAddress = entry.pairAddress
-  if (entry.priceAtScan != null && entry.priceAtScan > 0) card.priceUsd = entry.priceAtScan
+  const scanIsFresherThanTick = card.priceTickAt == null || !Number.isFinite(scanTs) || scanTs >= card.priceTickAt
+  if (entry.priceAtScan != null && entry.priceAtScan > 0 && scanIsFresherThanTick) card.priceUsd = entry.priceAtScan
   card.liquidityUsd = entry.liquidityUsd
   if (entry.early_strict) card.earlyStrict = { pass: entry.early_strict.pass, reason: entry.early_strict.reason }
   const raw = entry.rawData
@@ -195,6 +206,28 @@ export function enrichCardFromScan(
 
 export function listCards(store: Map<string, TokenCard>): TokenCard[] {
   return [...store.values()].sort((a, b) => b.firstSeenAt - a.firstSeenAt)
+}
+
+/**
+ * Applies a dex-price-feed tick to a card so the browser sees live price
+ * moves between scanner passes. Returns true when the card changed (i.e.
+ * the tick is fresh and newer than the last one applied) — the caller only
+ * broadcasts on true, so unchanged cache reads don't spam the SSE stream.
+ */
+export function applyPriceTick(card: TokenCard, tick: PriceUpdate, now: number, freshMs = PRICE_CACHE_FRESH_MS): boolean {
+  if (tick.priceUsd <= 0 || now - tick.timestamp > freshMs) return false
+  if (card.priceTickAt != null && tick.timestamp <= card.priceTickAt) return false
+  card.priceTickAt = tick.timestamp
+  card.priceUsd = tick.priceUsd
+  if (tick.liquidityUsd > 0) card.liquidityUsd = tick.liquidityUsd
+  if (tick.priceChange.m5 != null) card.priceChangeM5 = tick.priceChange.m5
+  if (tick.priceChange.h1 != null) card.priceChangeH1 = tick.priceChange.h1
+  if (card.volumeH1 != null && card.liquidityUsd != null && card.liquidityUsd > 0) {
+    card.volLiqRatio = card.volumeH1 / card.liquidityUsd
+    card.volLiqLow = card.volLiqRatio <= LOW_VOL_LIQUIDITY_RATIO_THRESHOLD
+  }
+  card.updatedAt = now
+  return true
 }
 
 // ==================== Scan-log tail (incremental, read-only) ====================
@@ -240,8 +273,16 @@ export async function startManualTradeUi(port = Number(process.env['MANUAL_UI_PO
   }
 
   // --- fast feeds: cards within seconds of on-chain creation ---
+  // Logs each distinct `pool` tag once, so it's diagnosable from the console
+  // whether the relay actually streams a given launchpad (e.g. mayhem).
+  const seenPools = new Set<string>()
   const pumpFeed = new PumpFunFeed({
     onNewToken: (t: PumpFunToken) => {
+      if (t.pool && !seenPools.has(t.pool)) {
+        seenPools.add(t.pool)
+        console.log(`manual-ui: pumpportal streams pool '${t.pool}' (premier token : ${t.symbol})`)
+      }
+      if (t.isMayhemMode) console.log(`manual-ui: token Mayhem — ${t.symbol} (${t.mintAddress})`)
       const card = upsertFastFeedCard(store, 'pump', t, Date.now())
       broadcast('card', card)
     },
@@ -278,10 +319,17 @@ export async function startManualTradeUi(port = Number(process.env['MANUAL_UI_PO
   setInterval(() => { void loadSilentDistributionFlags() }, SD_RELOAD_INTERVAL_MS)
 
   // --- price-feed subscriptions: newest enriched cards + open positions ---
+  // Each pass also pushes fresh cached ticks onto the cards, so the browser
+  // sees live price moves between scanner passes without any polling.
   const refreshPriceSubs = async (): Promise<void> => {
     const withPair = listCards(store).filter(c => c.pairAddress).slice(0, PRICE_SUB_CAP)
     for (const c of withPair) priceFeed.subscribe(c.pairAddress as string)
     for (const p of await getOpenManualPositions()) priceFeed.subscribe(p.pairAddress)
+    const now = Date.now()
+    for (const c of withPair) {
+      const tick = priceFeed.getLatestPrice(c.pairAddress as string)
+      if (tick && applyPriceTick(c, tick, now)) broadcast('card', c)
+    }
   }
   setInterval(() => { void refreshPriceSubs() }, SCAN_TAIL_INTERVAL_MS)
 

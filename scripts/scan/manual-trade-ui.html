@@ -31,12 +31,27 @@
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   td, th { padding: 3px 4px; text-align: left; border-bottom: 1px solid #21262d; }
   .pos { color: #3fb950; } .neg { color: #f85149; }
-  #toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: #1f6feb; color: #fff; padding: 8px 14px; border-radius: 8px; display: none; font-size: 13px; }
+  #toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: #1f6feb; color: #fff; padding: 8px 14px; border-radius: 8px; display: none; font-size: 13px; z-index: 20; }
+  #detail { position: fixed; inset: 0; background: rgba(1, 4, 9, .82); display: none; align-items: center; justify-content: center; z-index: 10; }
+  #detail.open { display: flex; }
+  #detailBox { background: #0d1117; border: 1px solid #30363d; border-radius: 10px; width: min(1100px, 94vw); height: min(720px, 92vh); display: flex; flex-direction: column; overflow: hidden; }
+  #detailHead { padding: 10px 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; background: #161b22; border-bottom: 1px solid #30363d; }
+  #detailHead .sym { font-size: 18px; font-weight: 800; }
+  #detailHead .name { color: #8b949e; font-size: 13px; }
+  #detailHead .grow { flex: 1; }
+  #detailHead a { color: #58a6ff; font-size: 12px; text-decoration: none; }
+  #detailHead a:hover { text-decoration: underline; }
+  .btn { border: 1px solid #30363d; border-radius: 8px; background: #21262d; color: #e6edf3; font-size: 13px; padding: 6px 12px; cursor: pointer; }
+  .btn.buy { background: #238636; border-color: #2ea043; font-weight: 700; }
+  .btn.buy:hover { background: #2ea043; }
+  #detailChart { flex: 1; border: 0; width: 100%; background: #0d1117; }
+  #detailNote { padding: 6px 14px; color: #8b949e; font-size: 12px; background: #161b22; border-top: 1px solid #30363d; }
 </style>
 </head>
 <body>
 <header>
   <h1>🎯 Entraînement manuel <span class="sub">paper — TP +100% (x2) / SL −20%</span></h1>
+  <label class="sub" style="cursor:pointer"><input type="checkbox" id="mayhemOnly" checked> Mayhem uniquement</label>
   <span class="sub" id="feedState">connexion…</span>
 </header>
 <main>
@@ -56,10 +71,29 @@
     </section>
   </aside>
 </main>
+<div id="detail">
+  <div id="detailBox">
+    <div id="detailHead"></div>
+    <iframe id="detailChart" title="graphique" allow="clipboard-write"></iframe>
+    <div id="detailNote"></div>
+  </div>
+</div>
 <div id="toast"></div>
 <script>
 const cards = new Map();
 const cardsEl = document.getElementById('cards');
+const mayhemOnlyEl = document.getElementById('mayhemOnly');
+
+// Filtre d'affichage : ne garde que les lancements pump.fun en Mayhem mode
+// (champ is_mayhem_mode du relais pumpportal). Les cartes venues de helius /
+// du scanner n'ont pas ce flag et sont donc masquées tant que le filtre est actif.
+function cardVisible(c) { return !mayhemOnlyEl.checked || c.isMayhemMode === true; }
+mayhemOnlyEl.onchange = () => {
+  for (const c of cards.values()) {
+    const el = document.getElementById('card-' + c.mint);
+    if (el) el.style.display = cardVisible(c) ? '' : 'none';
+  }
+};
 
 function ageInfo(c) {
   if (c.createdAt == null) return { txt: '—', cls: 'warn' };
@@ -70,23 +104,31 @@ function ageInfo(c) {
 function fmtUsd(v) { return v == null ? '—' : '$' + (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0)); }
 function fmtPrice(v) { return v == null ? '—' : '$' + Number(v).toPrecision(3); }
 
-function renderCard(c) {
-  let el = document.getElementById('card-' + c.mint);
-  if (!el) {
-    el = document.createElement('div');
-    el.className = 'card';
-    el.id = 'card-' + c.mint;
-    el.onclick = () => buy(c.mint);
-    cardsEl.prepend(el);
-  }
-  const a = ageInfo(c);
+function buildBadges(c) {
   const badges = [];
+  if (c.isMayhemMode) badges.push('<span class="b bad">🔥 mayhem</span>');
+  if (c.pool) badges.push('<span class="b info">' + escapeHtml(c.pool) + '</span>');
   if (c.earlyStrict) badges.push('<span class="b ' + (c.earlyStrict.pass ? 'good">EARLY_STRICT ✓' : 'bad">EARLY_STRICT ✗') + '</span>');
   if (c.sdFlagged) badges.push('<span class="b bad">🚩 silent-dist</span>');
   if (c.volLiqRatio != null) badges.push('<span class="b ' + (c.volLiqLow ? 'good' : 'info') + '">vol/liq ' + c.volLiqRatio.toFixed(1) + '</span>');
   if (c.hasWebsite) badges.push('<span class="b info">🌐 site</span>');
   if (c.hasSocials) badges.push('<span class="b info">💬 socials</span>');
   if (!c.earlyStrict && c.priceUsd == null) badges.push('<span class="b">en attente d\'enrichissement…</span>');
+  return badges;
+}
+
+function renderCard(c) {
+  let el = document.getElementById('card-' + c.mint);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'card';
+    el.id = 'card-' + c.mint;
+    el.onclick = () => openDetail(c.mint);
+    cardsEl.prepend(el);
+  }
+  el.style.display = cardVisible(c) ? '' : 'none';
+  const a = ageInfo(c);
+  const badges = buildBadges(c);
   el.innerHTML =
     '<div class="top"><span class="sym">' + escapeHtml(c.symbol) + '</span><span class="age ' + a.cls + '">' + a.txt + '</span></div>' +
     '<div class="row"><span>' + fmtPrice(c.priceUsd) + '</span><span>liq ' + fmtUsd(c.liquidityUsd) + '</span><span class="' + ((c.priceChangeM5 ?? 0) >= 0 ? 'pos' : 'neg') + '">m5 ' + (c.priceChangeM5 != null ? c.priceChangeM5.toFixed(1) + '%' : '—') + '</span></div>' +
@@ -99,7 +141,55 @@ function upsert(c) {
   cards.set(c.mint, c);
   renderCard(c);
   if (!known) trimCards();
+  if (c.mint === detailMint) renderDetail();
 }
+
+// ==================== fiche détaillée + graphique ====================
+let detailMint = null;
+let detailChartTarget = null; // pairAddress (ou mint) actuellement chargé dans l'iframe
+
+function chartTarget(c) { return c.pairAddress || c.mint; }
+
+function openDetail(mint) {
+  detailMint = mint;
+  detailChartTarget = null;
+  renderDetail();
+  document.getElementById('detail').classList.add('open');
+}
+function closeDetail() {
+  detailMint = null;
+  detailChartTarget = null;
+  document.getElementById('detail').classList.remove('open');
+  document.getElementById('detailChart').src = 'about:blank';
+}
+function renderDetail() {
+  const c = cards.get(detailMint);
+  if (!c) return;
+  const a = ageInfo(c);
+  document.getElementById('detailHead').innerHTML =
+    '<span class="sym">' + escapeHtml(c.symbol) + '</span>' +
+    (c.name ? '<span class="name">' + escapeHtml(c.name) + '</span>' : '') +
+    '<span class="age ' + a.cls + '">' + a.txt + '</span>' +
+    '<span class="sub">' + fmtPrice(c.priceUsd) + ' · liq ' + fmtUsd(c.liquidityUsd) + ' · <span class="' + ((c.priceChangeM5 ?? 0) >= 0 ? 'pos' : 'neg') + '">m5 ' + (c.priceChangeM5 != null ? c.priceChangeM5.toFixed(1) + '%' : '—') + '</span></span>' +
+    '<span class="badges">' + buildBadges(c).join('') + '</span>' +
+    '<span class="grow"></span>' +
+    '<a href="https://pump.fun/coin/' + encodeURIComponent(c.mint) + '" target="_blank" rel="noopener">pump.fun ↗</a>' +
+    '<a href="https://dexscreener.com/solana/' + encodeURIComponent(chartTarget(c)) + '" target="_blank" rel="noopener">dexscreener ↗</a>' +
+    '<button class="btn buy" onclick="buy(detailMint)">Acheter $50 (paper)</button>' +
+    '<button class="btn" onclick="closeDetail()">✕</button>';
+  // Ne recharge l'iframe que si la cible change (ex : la pair vient d'être indexée par le scan).
+  const target = chartTarget(c);
+  if (target !== detailChartTarget) {
+    detailChartTarget = target;
+    document.getElementById('detailChart').src =
+      'https://dexscreener.com/solana/' + encodeURIComponent(target) + '?embed=1&theme=dark&trades=0&info=0';
+  }
+  document.getElementById('detailNote').textContent = c.pairAddress
+    ? 'Graphique DexScreener de la pair ' + c.pairAddress
+    : 'Pair pas encore indexée par le scanner — DexScreener tente de résoudre le mint directement ; si le graphique reste vide (token encore sur la bonding curve), utilise le lien pump.fun ↗';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
+document.getElementById('detail').addEventListener('click', e => { if (e.target.id === 'detail') closeDetail(); });
 function trimCards() {
   while (cardsEl.children.length > 200) cardsEl.removeChild(cardsEl.lastChild);
 }
