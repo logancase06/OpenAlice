@@ -967,6 +967,44 @@ export async function appendJackpotShadowLog(entry: JackpotShadowLogEntry): Prom
   await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
 }
 
+// ==================== letsbonk.fun observation (2026-07-06) ====================
+// OBSERVATION ONLY — reconnaissance pass for a potential future extension,
+// zero impact on the 07-08 protocol and no trading decision reads this.
+// letsbonk.fun runs on Raydium LaunchLab (program
+// LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj, platform config
+// FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1); a direct logsSubscribe
+// feed on that program (helius-pool-feed pattern) is NOT built in this
+// pass — the pumpportal relay already tags these launches (pool: 'bonk'),
+// so this tap measures volume and data availability at zero new-socket
+// cost. Known limit, stated up front: relay coverage of letsbonk is
+// unverified — observed volume is a FLOOR, not the venue's true volume.
+// Field validation status (2026-07-06, n=15 — below the 30-50 bar, to be
+// completed as observation accumulates): mintAddress/symbol VALIDATED
+// on-chain 15/15 via Helius getAsset; creatorAddress (traderPublicKey) and
+// initialLiquidityUsd NOT VERIFIED for bonk-pool launches — do not build
+// on them without their own cross-validation.
+
+export interface LetsbonkObservationEntry {
+  timestamp: string
+  mintAddress: string
+  symbol: string
+  name: string
+  /** NOT VERIFIED for bonk launches — logged for future validation, not for use. */
+  creatorAddress?: string
+  /** NOT VERIFIED for bonk launches (SOL-in-curve conversion assumes pump.fun semantics). */
+  initialLiquidityUsd?: number
+}
+
+export function letsbonkObservationLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('letsbonk-observation', `${date}.jsonl`)
+}
+
+export async function appendLetsbonkObservationLog(entry: LetsbonkObservationEntry): Promise<void> {
+  const filePath = letsbonkObservationLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
 // ==================== Creator-launches observability (2026-07-06) ====================
 // Axis-1 collection (see data/retro/strategy-creator-2026-07-06.md): the
 // pumpportal feed carries the creator wallet (`traderPublicKey`) but it was
@@ -1949,6 +1987,17 @@ export async function handleNewPumpToken(token: PumpFunToken): Promise<void> {
   if (launch) {
     void appendCreatorLaunchLog(launch).catch(err =>
       console.warn(`live-scan: creator-launch log append failed — ${err instanceof Error ? err.message : String(err)}`))
+  }
+  // letsbonk observation tap — see the section header above; observation only.
+  if (token.pool === 'bonk') {
+    void appendLetsbonkObservationLog({
+      timestamp: new Date().toISOString(),
+      mintAddress: token.mintAddress,
+      symbol: token.symbol,
+      name: token.name,
+      creatorAddress: token.creatorAddress,
+      initialLiquidityUsd: token.initialLiquidityUsd,
+    }).catch(err => console.warn(`live-scan: letsbonk observation append failed — ${err instanceof Error ? err.message : String(err)}`))
   }
   // Dedup against the Helius pool feed below — see its own handleNewHeliusPool
   // for the symmetric check. Both are independent pump.fun-origin detection

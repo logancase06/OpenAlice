@@ -85,6 +85,7 @@ import {
   JACKPOT_CONFIG,
   jackpotWouldBuy,
   jackpotShadowLogPath,
+  letsbonkObservationLogPath,
   silentDistributionLogPath,
   positionTrajectoryLogPath,
   volLiquidityRatioLogPath,
@@ -219,6 +220,7 @@ afterEach(async () => {
   await rm(dataPath('post-graduation-trajectory'), { recursive: true, force: true })
   await rm(dataPath('sd-avoidance-shadow'), { recursive: true, force: true })
   await rm(dataPath('jackpot-shadow'), { recursive: true, force: true })
+  await rm(dataPath('letsbonk-observation'), { recursive: true, force: true })
   sdFlaggedTokens.clear()
   await rm(dataPath('snapshots'), { recursive: true, force: true })
   await rm(dataPath('positions'), { recursive: true, force: true })
@@ -1054,6 +1056,19 @@ describe('JACKPOT strategy — shadow by default', () => {
     // aucune position jackpot d'aucune sorte — ni réelle ni paper
     const positions = await getOpenPositions()
     expect(positions.filter(p => p.strategy === 'jackpot')).toHaveLength(0)
+  })
+})
+
+describe('letsbonk observation tap (observation only)', () => {
+  it('a pool=bonk feed token is appended to the letsbonk observation log; a pool=pump token is not', async () => {
+    await handleNewPumpToken({ mintAddress: 'bonkMint1', symbol: 'BNK', name: 'Bonk Test', createdAt: Date.now(), pool: 'bonk', creatorAddress: 'creatorB' } as PumpFunToken)
+    await handleNewPumpToken({ mintAddress: 'pumpMint1', symbol: 'PMP', name: 'Pump Test', createdAt: Date.now(), pool: 'pump' } as PumpFunToken)
+    await new Promise(r => setTimeout(r, 50)) // append is fire-and-forget
+
+    const raw = await readFile(letsbonkObservationLogPath(), 'utf-8')
+    const entries = raw.trim().split('\n').map(l => JSON.parse(l))
+    expect(entries.some(e => e.mintAddress === 'bonkMint1' && e.symbol === 'BNK')).toBe(true)
+    expect(entries.some(e => e.mintAddress === 'pumpMint1')).toBe(false)
   })
 })
 
