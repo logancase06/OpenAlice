@@ -888,6 +888,17 @@ export const WEB_LOWVOL_CONFIG: StrategyConfig = {
 // parallel-prep) is documented as a CANDIDATE, not included — it needs its
 // own revalidation, and it isn't knowable at entry time anyway.
 //
+// NON-NEGOTIABLE ACTIVATION GATE (2026-07-06, recorded in
+// winner-curse-correction-2026-07-06.md before the 07-08 review): the
+// ×1.93 hold-out behind this profile is NOT CONCLUSIVE by its own report
+// (n=20, Wilson CI95 2.8–30.1%). Flipping this flag to true FIRST requires
+// a chronological QUARTILE walk-forward of the frozen age+m5 cell (node
+// scripts/retro/jackpot-quartile-validation.mjs) showing lift > 1 in every
+// quartile with no inversion — the same bar every strategy of this session
+// was held to. A failed quartile test keeps this in shadow INDEFINITELY
+// (EARLY_WEB_FILTERED pattern), regardless of how good the shadow journal
+// or the enriched model look on the day.
+//
 // JACKPOT_STRATEGY_ENABLED=true adds the strategy to the active paper set
 // at startup (own broker, EARLY exit config). Default false = SHADOW ONLY:
 // every scanned candidate inside the age window gets a decision line in
