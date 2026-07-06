@@ -76,7 +76,15 @@ import {
   EARLY_CONFIG,
   EARLY_STRICT_CONFIG,
   EARLY_WEB_FILTERED_CONFIG,
+  WEB_LOWVOL_CONFIG,
+  LOW_VOL_LIQUIDITY_RATIO_THRESHOLD,
   EARLY_WEB_FILTERED_ENTRY_SUSPENDED,
+  recordCreatorLaunch,
+  lookupCreatorForMint,
+  JACKPOT_STRATEGY_ENABLED,
+  JACKPOT_CONFIG,
+  jackpotWouldBuy,
+  jackpotShadowLogPath,
   silentDistributionLogPath,
   positionTrajectoryLogPath,
   volLiquidityRatioLogPath,
@@ -210,6 +218,7 @@ afterEach(async () => {
   await rm(dataPath('vol-liquidity-ratio'), { recursive: true, force: true })
   await rm(dataPath('post-graduation-trajectory'), { recursive: true, force: true })
   await rm(dataPath('sd-avoidance-shadow'), { recursive: true, force: true })
+  await rm(dataPath('jackpot-shadow'), { recursive: true, force: true })
   sdFlaggedTokens.clear()
   await rm(dataPath('snapshots'), { recursive: true, force: true })
   await rm(dataPath('positions'), { recursive: true, force: true })
@@ -1012,6 +1021,104 @@ describe('EARLY_WEB_FILTERED_CONFIG', () => {
     expect(decision.tradeSimulated).toBe(false)
     expect(decision.reason).toMatch(/entry suspended/i)
     expect(await broker.getPositions()).toHaveLength(0)
+  })
+})
+
+describe('JACKPOT strategy — shadow by default', () => {
+  it('flag is OFF by default — the strategy must not be tradeable without explicit opt-in', () => {
+    expect(process.env['JACKPOT_STRATEGY_ENABLED']).not.toBe('true')
+    expect(JACKPOT_STRATEGY_ENABLED).toBe(false)
+  })
+
+  it('jackpotWouldBuy encodes exactly the robust profile: young age window + strong m5 + liquidity floor, NO h1 criterion', () => {
+    expect(jackpotWouldBuy({ ageMinutes: 40, m5: 5, liquidityUsd: 10_000 })).toBe(true)
+    expect(jackpotWouldBuy({ ageMinutes: 60, m5: 5, liquidityUsd: 10_000 })).toBe(false) // trop vieux
+    expect(jackpotWouldBuy({ ageMinutes: 20, m5: 5, liquidityUsd: 10_000 })).toBe(false) // sous la fenêtre scannée
+    expect(jackpotWouldBuy({ ageMinutes: 40, m5: 3, liquidityUsd: 10_000 })).toBe(false) // m5 sous le tercile fort
+    expect(jackpotWouldBuy({ ageMinutes: 40, m5: null, liquidityUsd: 10_000 })).toBe(false) // pas de donnée = pas d'achat
+    expect(jackpotWouldBuy({ ageMinutes: 40, m5: 5, liquidityUsd: 5_000 })).toBe(false) // sous le plancher de liq
+    expect(JACKPOT_CONFIG.maxPriceChangePct1h).toBeUndefined() // le slot h1 instable reste exclu
+  })
+
+  it('scan phase writes shadow decisions for in-window candidates and NEVER opens a jackpot position while the flag is off', async () => {
+    // candidat dans la fenêtre jackpot (age 40min) avec m5 fort — via le pipeline runScanPhase normal, SANS runtime jackpot
+    profilesMock.mockResolvedValue([{ chainId: 'solana', tokenAddress: 'jkpTok' }])
+    pairsMock.mockResolvedValue([pair({ address: 'jkpTok', ageMinutes: 40, priceUsd: '0.05', liquidity: { usd: 20_000 }, priceChange: { m5: 8, h1: 30 } })])
+    await runScanPhase('solana', [], new RateLimiter(), freshStats())
+
+    const raw = await readFile(jackpotShadowLogPath(), 'utf-8')
+    const entries = raw.trim().split('\n').map(l => JSON.parse(l))
+    const mine = entries.find(e => e.tokenAddress === 'jkpTok')
+    expect(mine).toMatchObject({ wouldBuy: true, m5: 8, liquidityUsd: 20_000 })
+    expect(mine.ageMinutes).toBeCloseTo(40, 0) // recalculé depuis pairCreatedAt au moment du scan — pas exactement 40.0
+    // aucune position jackpot d'aucune sorte — ni réelle ni paper
+    const positions = await getOpenPositions()
+    expect(positions.filter(p => p.strategy === 'jackpot')).toHaveLength(0)
+  })
+})
+
+describe('creator-launches registry (observability, axis 1)', () => {
+  it('ranks launches per creator per UTC day and resolves mint → creator for scan stamping', () => {
+    const day1 = Date.parse('2026-07-06T10:00:00Z')
+    expect(recordCreatorLaunch({ mintAddress: 'mintCr1', symbol: 'A', creatorAddress: 'creatorX', pool: 'pump' }, day1))
+      .toMatchObject({ creatorAddress: 'creatorX', mintAddress: 'mintCr1', creatorRankToday: 1 })
+    expect(recordCreatorLaunch({ mintAddress: 'mintCr2', symbol: 'B', creatorAddress: 'creatorX' }, day1 + 60_000))
+      .toMatchObject({ creatorRankToday: 2 })
+    expect(recordCreatorLaunch({ mintAddress: 'mintCr3', symbol: 'C', creatorAddress: 'creatorY' }, day1 + 120_000))
+      .toMatchObject({ creatorRankToday: 1 }) // compteur indépendant par créateur
+    expect(lookupCreatorForMint('mintCr2')).toEqual({ creatorAddress: 'creatorX', creatorRankToday: 2 })
+  })
+
+  it('resets ranks at UTC day rollover and returns null without a creator address', () => {
+    const day2 = Date.parse('2026-07-07T00:00:01Z')
+    expect(recordCreatorLaunch({ mintAddress: 'mintCr4', symbol: 'D', creatorAddress: 'creatorX' }, day2))
+      .toMatchObject({ creatorRankToday: 1 }) // creatorX était à 2 la veille
+    expect(recordCreatorLaunch({ mintAddress: 'mintNoCreator', symbol: 'E' }, day2)).toBeNull()
+    expect(lookupCreatorForMint('mintNoCreator')).toBeNull()
+  })
+})
+
+describe('WEB_LOWVOL_CONFIG', () => {
+  it('isolates the conjunction deltas (liq floor, requireWebsite, max vol/liq ratio) as the ONLY differences from EARLY_CONFIG', () => {
+    expect(WEB_LOWVOL_CONFIG.label).toBe('web_lowvol')
+    expect(WEB_LOWVOL_CONFIG.minLiquidityUsd).toBe(15000)
+    expect(WEB_LOWVOL_CONFIG.requireWebsite).toBe(true)
+    expect(WEB_LOWVOL_CONFIG.maxVolumeLiquidityRatio1h).toBe(LOW_VOL_LIQUIDITY_RATIO_THRESHOLD)
+    expect({ ...WEB_LOWVOL_CONFIG, label: EARLY_CONFIG.label, minLiquidityUsd: EARLY_CONFIG.minLiquidityUsd, requireWebsite: undefined, maxVolumeLiquidityRatio1h: undefined })
+      .toEqual({ ...EARLY_CONFIG, requireWebsite: undefined, maxVolumeLiquidityRatio1h: undefined })
+  })
+
+  it('rejects a candidate whose vol/liq ratio exceeds the low-turnover threshold even when a website is listed', async () => {
+    const broker = new DexBroker({ id: 'web-lowvol-reject-ratio', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    const candidate = pair({
+      address: 'hotTurnoverTok', ageMinutes: 100, priceUsd: '0.05',
+      liquidity: { usd: 20_000 }, volume: { h1: 200_000 }, // ratio 10 > 3.64
+      info: { websites: [{ url: 'https://example.com' }] },
+    })
+
+    const decision = await evaluateStrategy({ ...WEB_LOWVOL_CONFIG, useSolanaRpc: false }, 'solana', 'hotTurnoverTok', 100, broker, candidate)
+
+    expect(decision.pass).toBe(false)
+    expect(decision.reason).toMatch(/ratio too high/i)
+    expect(await broker.getPositions()).toHaveLength(0)
+  })
+
+  it('buys a candidate meeting the full conjunction (website + quiet turnover + liq floor) on the fast exit regime — entry NOT suspended', async () => {
+    const broker = new DexBroker({ id: 'web-lowvol-buy', chain: 'solana', paper: true, paperCashUsd: 1000 })
+    await broker.init()
+    const candidate = pair({
+      address: 'quietWebTok', ageMinutes: 100, priceUsd: '0.05',
+      liquidity: { usd: 20_000 }, volume: { h1: 40_000 }, // ratio 2 <= 3.64
+      info: { websites: [{ url: 'https://example.com' }] },
+    })
+
+    const decision = await evaluateStrategy({ ...WEB_LOWVOL_CONFIG, useSolanaRpc: false }, 'solana', 'quietWebTok', 100, broker, candidate)
+
+    expect(decision.pass).toBe(true)
+    expect(decision.tradeSimulated).toBe(true)
+    const positions = await getOpenPositions()
+    expect(positions.find(p => p.tokenAddress === 'quietWebTok')?.fastExitRegime).toBe(true)
   })
 })
 

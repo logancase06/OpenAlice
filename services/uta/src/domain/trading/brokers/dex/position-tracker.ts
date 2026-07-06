@@ -26,7 +26,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-export type StrategyLabel = 'conservative' | 'early' | 'momentum' | 'scalp_momentum' | 'early_strict' | 'early_web_filtered' | 'copy_wallet' | 'grad_immediate' | 'grad_dip' | 'manual'
+export type StrategyLabel = 'conservative' | 'early' | 'momentum' | 'scalp_momentum' | 'early_strict' | 'early_web_filtered' | 'copy_wallet' | 'grad_immediate' | 'grad_dip' | 'manual' | 'web_lowvol' | 'jackpot'
 
 export type ExitReason =
   | 'stop_loss'

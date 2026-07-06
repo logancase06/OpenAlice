@@ -313,6 +313,11 @@ export const EARLY_WEB_FILTERED_CONFIG: StrategyConfig = {
  */
 export const EARLY_WEB_FILTERED_ENTRY_SUSPENDED = true
 
+// WEB_LOWVOL_CONFIG (the web+lowVolLiq conjunction pilot) is defined after
+// the vol-liquidity-ratio observability section below — it references
+// LOW_VOL_LIQUIDITY_RATIO_THRESHOLD, which is declared there (module-scope
+// const, so a use-before-declaration here would be a TDZ crash at load).
+
 // COPY_WALLET exit config, adopted 2026-07-02 alongside the preset below —
 // tighter and faster than EARLY_EXIT_CONFIG on the premise that a wallet
 // with a real, independently-measured track record (wallet-bootstrapper.ts)
@@ -628,10 +633,20 @@ export interface ScanLogEntry {
   scalp_momentum: StrategyDecision
   early_strict: StrategyDecision
   early_web_filtered: StrategyDecision
+  web_lowvol: StrategyDecision
   velocityContext: { tokensPerHour: number; trend: MarketVelocity['trend'] }
   walletSignals: WalletSignal[]
   nameFilter: { riskScore: number; flags: string[] }
   rawData: ScanLogRawData
+  /** Observability only (axis 1) — wallet that created the token, when the pumpportal feed saw the launch. Absent = token discovered via DexScreener without a feed sighting. */
+  creatorAddress?: string
+  /** Observability only (axis 1) — 1 = this creator's first launch observed today (UTC), 2 = second, … */
+  creatorRankToday?: number
+  /** Observability only (axis 4) — unique holders sampled via Helius (30min refresh, fire-and-forget; absent on a token's first sighting or without HELIUS_API_KEY). */
+  holdersCount?: number
+  /** True when the holders sample hit the 1000-account page cap — holdersCount is then a floor, not an exact count. */
+  holdersCountCapped?: boolean
+  holdersCheckedAt?: string
 }
 
 export interface ExitLogEntry {
@@ -805,6 +820,287 @@ export async function appendVolLiquidityRatioLog(entry: VolLiquidityRatioLogEntr
   const filePath = volLiquidityRatioLogPath()
   await mkdir(dirname(filePath), { recursive: true })
   await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
+/**
+ * Adopted 2026-07-05 — parallel pilot testing the CONJUNCTION of the two
+ * signals that were each independently positive on the 07-01→07-05 dataset
+ * but individually insufficient: `requireWebsite` (piloted alone as
+ * early_web_filtered, suspended after failing live — see
+ * EARLY_WEB_FILTERED_ENTRY_SUSPENDED) and the low vol/liquidity ratio
+ * (retained as observation-only by the 2026-07-04 strategy-idea pass — see
+ * LOW_VOL_LIQUIDITY_RATIO_THRESHOLD's docstring above). Per that suspension
+ * docstring's own reopen bar ("a different hypothesis or a materially
+ * different sample"), this is the different hypothesis: not "web is good"
+ * but "web AND quiet turnover together select creators who invested before
+ * the crowd arrives" — plus two extra days of data.
+ *
+ * Retrospective evidence (2026-07-05 mining session):
+ *  - Feature join on n=4894 closed trades (07-01→07-05): vol/liq <= 3.64 at
+ *    entry gave +0.6pp avg vs -2.6pp above the threshold; hasWebsite gave
+ *    -1.5pp vs -1.9pp (weak alone).
+ *  - Snapshot backtest on scan-log trajectories (67 250 points / 1 375
+ *    tokens, ~10min cadence, pessimistic SL-first fill between snapshots,
+ *    one entry per token): this rule (age 30-360, liq >= 15k, website,
+ *    ratio <= 3.64) with the ConfigD-like TP+40/SL-20/180min bracket:
+ *    n=43 tokens, win 58%, avg +14.9pp. Same harness on an
+ *    early_strict-like base rule: -0.1pp (sanity check against the live
+ *    -1.9pp, harness plausible if slightly optimistic).
+ *
+ * Known weaknesses, stated up front: n=43 is small; 8 candidate rules were
+ * screened in the same session so the winner carries selection bias (true
+ * effect will be lower); and the web half of the signal already failed a
+ * live pilot on its own. The vol/liq half's retro had one soft quartile
+ * (see LOW_VOL_LIQUIDITY_RATIO_THRESHOLD). This is a pilot, not a
+ * validated strategy.
+ *
+ * Config deltas vs EARLY (kept minimal so live results are attributable):
+ * minLiquidityUsd raised to the backtest rule's 15k floor (matches
+ * EARLY_STRICT's), `requireWebsite`, and `maxVolumeLiquidityRatio1h` at the
+ * observability pass's threshold. NOTE: the guard's ratio check skips when
+ * volume/liquidity data is missing (house "missing data ⇒ skip"
+ * convention), which is more permissive than the backtest rule (which
+ * required the data to be present) — if live results diverge from the
+ * backtest, check what fraction of entries came through the missing-data
+ * path before concluding the signal failed.
+ *
+ * Graduation/suspension bar (same as early_web_filtered's, held to
+ * token-weighted numbers): n >= 30 unique tokens live, token-weighted avg
+ * return > 0, AND a chronological quartile split with no sign reversal —
+ * then consider promoting the conjunction into EARLY/EARLY_STRICT filters.
+ * A miss suspends entry via the same pattern as the other pilots.
+ */
+export const WEB_LOWVOL_CONFIG: StrategyConfig = {
+  ...EARLY_CONFIG,
+  label: 'web_lowvol',
+  minLiquidityUsd: 15000,
+  requireWebsite: true,
+  maxVolumeLiquidityRatio1h: LOW_VOL_LIQUIDITY_RATIO_THRESHOLD,
+}
+
+// ==================== JACKPOT strategy — shadow by default (2026-07-06) ====================
+// Chases the ROBUST big-winner profile from big-winners-pattern /
+// winner-curse-correction (2026-07-06): token YOUNG (bottom age tercile of
+// the traded universe, < ~55 min) × m5 STRONG (top tercile, > ~3.5%).
+// Deliberately NO h1 criterion — that slot was shown to be selection noise
+// (winner-curse-correction: re-running selection on half 1 picks tph, not
+// h1). The v30 post-entry velocity (+0.025 test AUC marginal, chantier 3 of
+// parallel-prep) is documented as a CANDIDATE, not included — it needs its
+// own revalidation, and it isn't knowable at entry time anyway.
+//
+// JACKPOT_STRATEGY_ENABLED=true adds the strategy to the active paper set
+// at startup (own broker, EARLY exit config). Default false = SHADOW ONLY:
+// every scanned candidate inside the age window gets a decision line in
+// data/jackpot-shadow/{date}.jsonl (features + wouldBuy), no order of any
+// kind. The shadow journal accumulates while the creator/holders collections
+// run, so the 2026-07-08 analysis can compare theoretical picks against
+// real token outcomes without recoding anything.
+//
+// NOTE — the product arbitration documented in winner-curse-correction
+// (jackpot profile vs early_strict's anti-crash h1 cap) stays open: this
+// config intentionally has NO maxPriceChangePct1h, accepting crash exposure
+// early_strict rejects. That is exactly why it must live as a SEPARATE
+// strategy with its own risk budget, never as a loosened early_strict.
+
+export const JACKPOT_STRATEGY_ENABLED = process.env['JACKPOT_STRATEGY_ENABLED'] === 'true'
+/** Terciles of the 5 050-trade big-winners dataset (recomputed 2026-07-06): age bottom tercile boundary and m5 top tercile boundary. */
+export const JACKPOT_MAX_AGE_MINUTES = 55
+export const JACKPOT_MIN_M5_PCT = 3.55
+
+export const JACKPOT_CONFIG: StrategyConfig = {
+  label: 'jackpot',
+  minAgeMinutes: 30, // scanned universe starts at 30 min — the "young" tercile is 30-55 min
+  maxAgeMinutes: JACKPOT_MAX_AGE_MINUTES,
+  minLiquidityUsd: 8000, // EARLY's floor — the profile was measured on trades that all cleared it
+  requireGoPlus: false,
+  useSolanaRpc: true,
+  useLiquidityTracker: true,
+  requireEnoughSnapshots: false,
+  minBuyTxns1h: 15,
+  maxSellBuyRatio1h: 3.0,
+  minLiquidityGrowthPct: -20,
+  maxSellPressure: 0.7,
+  requirePositiveMomentum: true,
+  minPriceChangePct5m: JACKPOT_MIN_M5_PCT,
+  exitConfig: EARLY_EXIT_CONFIG,
+}
+
+export interface JackpotShadowLogEntry {
+  timestamp: string
+  tokenAddress: string
+  symbol: string
+  wouldBuy: boolean
+  ageMinutes: number
+  m5: number | null
+  h1: number | null
+  liquidityUsd: number
+  volLiqRatio: number | null
+  priceAtScan: number
+}
+
+/** Pure decision — the exact robust profile (age window is the caller's gate; this only judges m5). Exported for tests. */
+export function jackpotWouldBuy(entry: { ageMinutes: number; m5: number | null; liquidityUsd: number }): boolean {
+  return entry.ageMinutes >= JACKPOT_CONFIG.minAgeMinutes
+    && entry.ageMinutes < JACKPOT_MAX_AGE_MINUTES
+    && entry.liquidityUsd >= (JACKPOT_CONFIG.minLiquidityUsd ?? 0)
+    && entry.m5 != null && entry.m5 > JACKPOT_MIN_M5_PCT
+}
+
+export function jackpotShadowLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('jackpot-shadow', `${date}.jsonl`)
+}
+
+export async function appendJackpotShadowLog(entry: JackpotShadowLogEntry): Promise<void> {
+  const filePath = jackpotShadowLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
+// ==================== Creator-launches observability (2026-07-06) ====================
+// Axis-1 collection (see data/retro/strategy-creator-2026-07-06.md): the
+// pumpportal feed carries the creator wallet (`traderPublicKey`) but it was
+// never persisted — this registry appends one line per observed launch, and
+// stamps scan-log entries with creatorAddress + the launch's rank in that
+// creator's day (1st, 2nd, …) so future trades can be joined without any
+// after-the-fact reconstruction. Observation ONLY — no filter reads this.
+// Token fate (rug/dead/graduated) is deliberately NOT tracked in place:
+// it is derivable at analysis time from scan-log + graduated/active.json,
+// and an in-place updater would be a second source of truth to keep honest.
+// Creator supply % is NOT collected — it needs a mint-time RPC call this
+// pass deliberately avoids (see the axis-1 report's "optionnel" note).
+
+export function creatorLaunchLogPath(date: string = new Date().toISOString().slice(0, 10)): string {
+  return dataPath('creator-launches', `${date}.jsonl`)
+}
+
+export interface CreatorLaunchLogEntry {
+  timestamp: string
+  creatorAddress: string
+  mintAddress: string
+  symbol: string
+  pool?: string
+  isMayhemMode?: boolean
+  /** 1 = first launch observed for this wallet today (UTC), 2 = second, … resets at day rollover. */
+  creatorRankToday: number
+}
+
+/** mint → creator info for scan-log stamping. FIFO-capped: at ~1100 launches/h, 50k entries ≈ 2 days of lookback, plenty for the 30-360min scan windows. */
+const CREATOR_MINT_MAP_CAP = 50_000
+const mintCreatorMap = new Map<string, { creatorAddress: string; creatorRankToday: number }>()
+let creatorCountsDay = ''
+let creatorCountsToday = new Map<string, number>()
+
+/** Pure registry update — returns the log entry to append, or null when the feed message carried no creator. Exported for tests. */
+export function recordCreatorLaunch(
+  t: { mintAddress: string; symbol: string; creatorAddress?: string; pool?: string; isMayhemMode?: boolean },
+  now = Date.now(),
+): CreatorLaunchLogEntry | null {
+  if (!t.creatorAddress) return null
+  const day = new Date(now).toISOString().slice(0, 10)
+  if (day !== creatorCountsDay) {
+    creatorCountsDay = day
+    creatorCountsToday = new Map()
+  }
+  const rank = (creatorCountsToday.get(t.creatorAddress) ?? 0) + 1
+  creatorCountsToday.set(t.creatorAddress, rank)
+  mintCreatorMap.set(t.mintAddress, { creatorAddress: t.creatorAddress, creatorRankToday: rank })
+  while (mintCreatorMap.size > CREATOR_MINT_MAP_CAP) {
+    const oldest = mintCreatorMap.keys().next().value
+    if (oldest === undefined) break
+    mintCreatorMap.delete(oldest)
+  }
+  return {
+    timestamp: new Date(now).toISOString(),
+    creatorAddress: t.creatorAddress,
+    mintAddress: t.mintAddress,
+    symbol: t.symbol,
+    pool: t.pool,
+    isMayhemMode: t.isMayhemMode,
+    creatorRankToday: rank,
+  }
+}
+
+export function lookupCreatorForMint(mintAddress: string): { creatorAddress: string; creatorRankToday: number } | null {
+  return mintCreatorMap.get(mintAddress) ?? null
+}
+
+export async function appendCreatorLaunchLog(entry: CreatorLaunchLogEntry): Promise<void> {
+  const filePath = creatorLaunchLogPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+}
+
+// ==================== Holders-count observability (2026-07-06) ====================
+// Axis-4 collection (see data/retro/strategy-social-2026-07-06.md): unique
+// holder count at scan time via the existing Helius key. Fire-and-forget
+// design: the scan loop only READS the cache (peekHoldersCount) and kicks an
+// async warm — it never awaits the RPC, so a slow/failed Helius call cannot
+// stretch the scan cycle. Consequence: a token's FIRST scan has no holders
+// field; data lands from its second sighting (~9 min later) — fine for a
+// 48h observation pass. Refresh at most every 30 min per token, so the call
+// budget is ~2/token/h (~400/h at 200 tracked tokens), far under Helius
+// limits. Observation ONLY — no filter reads this.
+
+const HOLDERS_REFRESH_MS = 30 * 60_000
+const HOLDERS_TIMEOUT_MS = 5_000
+const HOLDERS_CACHE_CAP = 5_000
+interface HoldersCacheEntry { count: number | null; capped: boolean; at: number }
+const holdersCache = new Map<string, HoldersCacheEntry>()
+const holdersInFlight = new Set<string>()
+let holdersApiCallsHour = ''
+let holdersApiCallsCount = 0
+
+export function peekHoldersCount(tokenAddress: string): { count: number; capped: boolean; at: number } | null {
+  const e = holdersCache.get(tokenAddress)
+  return e && e.count != null ? { count: e.count, capped: e.capped, at: e.at } : null
+}
+
+/** Kicks an async holders fetch when the cache entry is missing/stale. Never throws, never awaited by callers. */
+export function warmHoldersCache(tokenAddress: string): void {
+  const key = process.env['HELIUS_API_KEY']
+  if (!key) return
+  const cached = holdersCache.get(tokenAddress)
+  if (cached && Date.now() - cached.at < HOLDERS_REFRESH_MS) return
+  if (holdersInFlight.has(tokenAddress)) return
+  holdersInFlight.add(tokenAddress)
+  void (async () => {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), HOLDERS_TIMEOUT_MS)
+    try {
+      const hour = new Date().toISOString().slice(0, 13)
+      if (hour !== holdersApiCallsHour) {
+        if (holdersApiCallsHour) console.log(`live-scan: holders observability — ${holdersApiCallsCount} appels Helius sur l'heure ${holdersApiCallsHour}`)
+        holdersApiCallsHour = hour
+        holdersApiCallsCount = 0
+      }
+      holdersApiCallsCount++
+      const resp = await fetch(`https://mainnet.helius-rpc.com/?api-key=${key}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'holders-obs', method: 'getTokenAccounts', params: { mint: tokenAddress, limit: 1000, page: 1 } }),
+        signal: controller.signal,
+      })
+      const data = await resp.json() as { result?: { token_accounts?: Array<{ owner?: string }> } } | null
+      const accounts = data?.result?.token_accounts
+      if (!Array.isArray(accounts)) {
+        holdersCache.set(tokenAddress, { count: null, capped: false, at: Date.now() }) // negative cache — retry after the refresh window, not every scan
+        return
+      }
+      // Unique owners, not token accounts — one wallet can hold through several accounts.
+      const owners = new Set(accounts.map(a => a.owner).filter((o): o is string => !!o))
+      holdersCache.set(tokenAddress, { count: owners.size, capped: accounts.length >= 1000, at: Date.now() })
+      while (holdersCache.size > HOLDERS_CACHE_CAP) {
+        const oldest = holdersCache.keys().next().value
+        if (oldest === undefined) break
+        holdersCache.delete(oldest)
+      }
+    } catch {
+      holdersCache.set(tokenAddress, { count: null, capped: false, at: Date.now() })
+    } finally {
+      clearTimeout(timeout)
+      holdersInFlight.delete(tokenAddress)
+    }
+  })()
 }
 
 // ==================== Post-graduation trajectory observability (2026-07-04) ====================
@@ -1375,7 +1671,7 @@ export interface ScanStats {
 }
 
 export function freshStats(): ScanStats {
-  return { cycles: 0, scanned: 0, passed: { conservative: 0, early: 0, momentum: 0, scalp_momentum: 0, early_strict: 0, early_web_filtered: 0, copy_wallet: 0, grad_immediate: 0, grad_dip: 0 } }
+  return { cycles: 0, scanned: 0, passed: { conservative: 0, early: 0, momentum: 0, scalp_momentum: 0, early_strict: 0, early_web_filtered: 0, copy_wallet: 0, grad_immediate: 0, grad_dip: 0, web_lowvol: 0, jackpot: 0 } }
 }
 
 /**
@@ -1523,6 +1819,30 @@ export async function runScanPhase(
 
     const nameFilter = checkTokenName(pair.baseToken.symbol, pair.baseToken.name)
     const walletSignals = chain === 'solana' ? await getWalletSignals(profile.tokenAddress) : []
+    const creator = lookupCreatorForMint(profile.tokenAddress)
+    const holders = chain === 'solana' ? peekHoldersCount(profile.tokenAddress) : null
+    if (chain === 'solana') warmHoldersCache(profile.tokenAddress)
+
+    // JACKPOT shadow journal — one decision line per candidate inside the
+    // strategy's age window, whether or not the flag is on (the journal is
+    // the validation dataset either way). Never trades from here.
+    if (ageMinutes >= JACKPOT_CONFIG.minAgeMinutes && ageMinutes < JACKPOT_MAX_AGE_MINUTES) {
+      const m5 = pair.priceChange?.m5 ?? null
+      const liquidityUsd = pair.liquidity?.usd ?? 0
+      const volH1 = pair.volume?.h1
+      await appendJackpotShadowLog({
+        timestamp: new Date(now).toISOString(),
+        tokenAddress: profile.tokenAddress,
+        symbol: pair.baseToken.symbol,
+        wouldBuy: jackpotWouldBuy({ ageMinutes, m5, liquidityUsd }),
+        ageMinutes,
+        m5,
+        h1: pair.priceChange?.h1 ?? null,
+        liquidityUsd,
+        volLiqRatio: volH1 != null && liquidityUsd > 0 ? volH1 / liquidityUsd : null,
+        priceAtScan: Number(pair.priceUsd ?? 0),
+      })
+    }
 
     await appendScanLog({
       type: 'scan',
@@ -1539,9 +1859,15 @@ export async function runScanPhase(
       scalp_momentum: decisions.scalp_momentum ?? { pass: false, reason: 'not evaluated' },
       early_strict: decisions.early_strict ?? { pass: false, reason: 'not evaluated' },
       early_web_filtered: decisions.early_web_filtered ?? { pass: false, reason: 'not evaluated' },
+      web_lowvol: decisions.web_lowvol ?? { pass: false, reason: 'not evaluated' },
       velocityContext: { tokensPerHour: velocity.tokensPerHour, trend: velocity.trend },
       walletSignals,
       nameFilter: { riskScore: nameFilter.riskScore, flags: nameFilter.flags },
+      creatorAddress: creator?.creatorAddress,
+      creatorRankToday: creator?.creatorRankToday,
+      holdersCount: holders?.count,
+      holdersCountCapped: holders?.capped || undefined,
+      holdersCheckedAt: holders ? new Date(holders.at).toISOString() : undefined,
       rawData: {
         priceChange: { m5: pair.priceChange?.m5, h1: pair.priceChange?.h1, h6: pair.priceChange?.h6 },
         volume: { m5: pair.volume?.m5, h1: pair.volume?.h1, h6: pair.volume?.h6 },
@@ -1605,6 +1931,14 @@ export const pumpWatchlist = new Map<string, WatchlistEntry>()
  * crash the main scanner" contract (see pump-fun-feed.ts's file header).
  */
 export async function handleNewPumpToken(token: PumpFunToken): Promise<void> {
+  // Creator registry BEFORE the Helius dedup — the creator wallet only
+  // travels on the pumpportal message, and the registry must stay complete
+  // regardless of which feed claimed the token for the watchlist.
+  const launch = recordCreatorLaunch({ mintAddress: token.mintAddress, symbol: token.symbol, creatorAddress: token.creatorAddress, pool: token.pool, isMayhemMode: token.isMayhemMode })
+  if (launch) {
+    void appendCreatorLaunchLog(launch).catch(err =>
+      console.warn(`live-scan: creator-launch log append failed — ${err instanceof Error ? err.message : String(err)}`))
+  }
   // Dedup against the Helius pool feed below — see its own handleNewHeliusPool
   // for the symmetric check. Both are independent pump.fun-origin detection
   // mechanisms; without this, a token caught by one moments before the
@@ -1855,7 +2189,7 @@ const FAST_EXIT_CHECK_INTERVAL_MS = 5_000
 // the manual-trade CLI's own 5s loop (never by the scanner — see
 // scripts/scan/manual-trade.ts's header), and inclusion here gives them the
 // same position-trajectory tick logging as the other fast-regime strategies.
-const FAST_EXIT_REGIME_LABELS: ReadonlySet<StrategyLabel> = new Set(['early', 'early_strict', 'early_web_filtered', 'grad_immediate', 'manual'])
+const FAST_EXIT_REGIME_LABELS: ReadonlySet<StrategyLabel> = new Set(['early', 'early_strict', 'early_web_filtered', 'grad_immediate', 'manual', 'web_lowvol', 'jackpot'])
 
 function isFastExitRegimeStrategy(label: StrategyLabel): boolean {
   return FAST_EXIT_REGIME_LABELS.has(label)
@@ -2229,7 +2563,7 @@ export function parseArgs(argv: string[]): { chain: DexChain; intervalSeconds: n
 
 export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promise<void> {
   const { chain, intervalSeconds, scanIntervalSeconds } = parseArgs(argv)
-  console.log(`live-scan: starting on chain=${chain}, exit-check interval=${intervalSeconds}s, new-token scan interval=${scanIntervalSeconds}s (paper mode, 4 strategies)`)
+  console.log(`live-scan: starting on chain=${chain}, exit-check interval=${intervalSeconds}s, new-token scan interval=${scanIntervalSeconds}s (paper mode, 5 strategies)`)
   console.log(process.env['HELIUS_API_KEY'] ? 'RPC: Helius (dedicated)' : 'RPC: Solana public (rate-limited — set HELIUS_API_KEY)')
   // process.pid is Node's own real OS PID — unlike a bash `$!` for a directly
   // exec'd native process on Windows/Git-Bash, this is always accurate.
@@ -2242,7 +2576,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   priceFeed.setChain(chain)
   console.log('Price feed   : Batch HTTP toutes les 3s')
   console.log(`Exit checker : every ${intervalSeconds}s (lecture cache) — conservative, grad_dip`)
-  console.log(`Exit checker (fast) : every ${FAST_EXIT_CHECK_INTERVAL_MS / 1000}s (lecture cache, coût réseau nul) — early, early_strict, early_web_filtered, grad_immediate`)
+  console.log(`Exit checker (fast) : every ${FAST_EXIT_CHECK_INTERVAL_MS / 1000}s (lecture cache, coût réseau nul) — early, early_strict, early_web_filtered, web_lowvol, grad_immediate`)
   console.log(`Token scanner: every ${scanIntervalSeconds}s`)
   console.log('Pump.fun feed : pumpportal.fun (third-party relay)')
   console.log('              ⚠ Not affiliated with pump.fun')
@@ -2260,12 +2594,14 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   const earlyBroker = new DexBroker({ id: `scan-early-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const earlyStrictBroker = new DexBroker({ id: `scan-early-strict-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const earlyWebFilteredBroker = new DexBroker({ id: `scan-early-web-filtered-${chain}`, chain, paper: true, paperCashUsd: 1000 })
+  const webLowvolBroker = new DexBroker({ id: `scan-web-lowvol-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const gradImmediateBroker = new DexBroker({ id: `scan-grad-immediate-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   const gradDipBroker = new DexBroker({ id: `scan-grad-dip-${chain}`, chain, paper: true, paperCashUsd: 1000 })
   await conservativeBroker.init()
   await earlyBroker.init()
   await earlyStrictBroker.init()
   await earlyWebFilteredBroker.init()
+  await webLowvolBroker.init()
   await gradImmediateBroker.init()
   await gradDipBroker.init()
 
@@ -2278,6 +2614,7 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
   console.log(`GRAD_IMMEDIATE   : ${GRAD_IMMEDIATE_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-02, negative expectancy — see GRAD_IMMEDIATE_ENTRY_SUSPENDED docstring); exits for existing positions still active' : heliusKeyPresent ? `enabled (${GRAD_IMMEDIATE_POST_GRAD_DELAY_MS / 1000}s delay post-graduation)` : 'disabled — needs Graduation feed'}`)
   console.log(`GRAD_DIP         : ${GRAD_DIP_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-03, no positive signal on clean n=33/12 tokens — see GRAD_DIP_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled (25-60% dip from peak)'}`)
   console.log(`EARLY_WEB_FILTERED : ${EARLY_WEB_FILTERED_ENTRY_SUSPENDED ? 'entry SUSPENDED (2026-07-04, reopen bar cleared at n=34 tokens but token-weighted return -3.95pp with a Q3->Q4 sign reversal — see EARLY_WEB_FILTERED_ENTRY_SUSPENDED docstring); exits for existing positions still active' : 'enabled, parallel pilot (requireWebsite, EARLY otherwise unchanged) — see EARLY_WEB_FILTERED_CONFIG docstring for the quartile-instability caveat and n≥30+quartile reopen threshold'}`)
+  console.log(`WEB_LOWVOL       : enabled, parallel pilot (requireWebsite + vol/liq ratio <= ${LOW_VOL_LIQUIDITY_RATIO_THRESHOLD} + liq >= $15k, EARLY otherwise unchanged) — backtest n=43 win 58% avg +14.9pp, graduation bar n>=30 tokens token-weighted >0 without quartile reversal (see WEB_LOWVOL_CONFIG docstring)`)
 
   // EARLY_STRICT replaces SCALP_MOMENTUM_CONFIG here — see EARLY_STRICT_CONFIG's
   // docstring for why (SCALP stayed at 0/120 passes even after relaxing its
@@ -2293,7 +2630,19 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
     { config: EARLY_CONFIG, broker: earlyBroker },
     { config: EARLY_STRICT_CONFIG, broker: earlyStrictBroker },
     { config: EARLY_WEB_FILTERED_CONFIG, broker: earlyWebFilteredBroker },
+    { config: WEB_LOWVOL_CONFIG, broker: webLowvolBroker },
   ]
+  // JACKPOT: flag-gated (default OFF = shadow journal only, see the config's
+  // section header). The broker is only constructed when actually enabled so
+  // the disabled path provably has nothing to trade with.
+  if (JACKPOT_STRATEGY_ENABLED) {
+    const jackpotBroker = new DexBroker({ id: `scan-jackpot-${chain}`, chain, paper: true, paperCashUsd: 1000 })
+    await jackpotBroker.init()
+    strategies.push({ config: JACKPOT_CONFIG, broker: jackpotBroker })
+    console.log(`JACKPOT          : ACTIVE (paper) — age 30-${JACKPOT_MAX_AGE_MINUTES}min, m5 > ${JACKPOT_MIN_M5_PCT}%, PAS de cap h1 (arbitrage crash documenté dans winner-curse-correction)`)
+  } else {
+    console.log(`JACKPOT          : shadow only (JACKPOT_STRATEGY_ENABLED != 'true') — journal des décisions dans data/jackpot-shadow/, aucun ordre d'aucune sorte`)
+  }
   // Kept separate from `strategies` — never passed to runScanPhase, so
   // GRAD_IMMEDIATE/GRAD_DIP are never evaluated against the generic
   // DexScreener-candidate loop (see the graduation-strategies section
@@ -2484,7 +2833,9 @@ export async function runLiveScan(argv: string[] = process.argv.slice(2)): Promi
       await logSummary('hourly', strategies, stats, heliusPoolFeed, gradStrategies, graduatedTracker)
       stats.cycles = 0
       stats.scanned = 0
-      stats.passed = { conservative: 0, early: 0, momentum: 0, scalp_momentum: 0, early_strict: 0, early_web_filtered: 0, copy_wallet: 0, grad_immediate: 0, grad_dip: 0 }
+      // freshStats() rather than a second literal — a label added to freshStats
+      // but not here would silently NaN its counter after the first hourly reset.
+      stats.passed = freshStats().passed
       stopLossOvershootCount = 0
       lastHourlyLog = Date.now()
     }
