@@ -79,13 +79,22 @@ for (let q = 0; q < 4; q++) {
   out.push(`| Q${q + 1} | ${sub.length} | ${cell.length} | ${cellRate.toFixed(1)}% | ${baseRate.toFixed(1)}% | **×${lift.toFixed(2)}** | ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}% |`)
 }
 out.push('')
+// Rentabilité agrégée de la cellule sur TOUT l'échantillon — condition
+// distincte du taux de tops (clause du 2026-07-06 : un bon taux de jackpots
+// ne suffit pas si la cellule reste perdante en moyenne).
+const cellAll = rows.filter(r => r.inCell)
+const cellMeanReturn = cellAll.length ? cellAll.reduce((a, r) => a + r.ret, 0) / cellAll.length : 0
+out.push(`Retour moyen AGRÉGÉ de la cellule (tout l'échantillon, n=${cellAll.length}) : **${cellMeanReturn >= 0 ? '+' : ''}${cellMeanReturn.toFixed(2)}%**`)
+out.push('')
 let verdict
 if (insufficient) {
   verdict = `INSUFFISANT — au moins un quartile sous ${MIN_CELL_PER_QUARTILE} membres de cellule. Attendre plus de données ; NE PAS activer.`
-} else if (lifts.every(l => l > 1)) {
-  verdict = `PASSÉ — lift > 1 dans les 4 quartiles (${lifts.map(l => '×' + l.toFixed(2)).join(', ')}), aucune inversion. La condition quartile de l'activation est remplie (les AUTRES volets du 8 juillet restent requis).`
+} else if (!lifts.every(l => l > 1)) {
+  verdict = `ÉCHEC (taux de jackpots) — lift <= 1 dans au moins un quartile (${lifts.map(l => '×' + l.toFixed(2)).join(', ')}). Jackpot reste en shadow INDÉFINIMENT (pattern EARLY_WEB_FILTERED), quels que soient les résultats du shadow/modèle enrichi.`
+} else if (cellMeanReturn <= 0) {
+  verdict = `ÉCHEC (rentabilité) — le taux de jackpots passe (${lifts.map(l => '×' + l.toFixed(2)).join(', ')}) MAIS le retour moyen agrégé de la cellule est ${cellMeanReturn.toFixed(2)}% <= 0 : capturer plus de gros gagnants ne rend pas la cellule viable, elle reste perdante en moyenne. PAS D'ACTIVATION.`
 } else {
-  verdict = `ÉCHEC — lift <= 1 dans au moins un quartile (${lifts.map(l => '×' + l.toFixed(2)).join(', ')}). Jackpot reste en shadow INDÉFINIMENT (pattern EARLY_WEB_FILTERED), quels que soient les résultats du shadow/modèle enrichi.`
+  verdict = `PASSÉ — lift > 1 dans les 4 quartiles (${lifts.map(l => '×' + l.toFixed(2)).join(', ')}), aucune inversion, ET retour moyen agrégé de la cellule positif (+${cellMeanReturn.toFixed(2)}%). Les DEUX conditions quartile+rentabilité sont remplies (les autres volets du 8 juillet restent requis).`
 }
 out.push(`## Verdict : ${verdict}`)
 const date = new Date().toISOString().slice(0, 10)
